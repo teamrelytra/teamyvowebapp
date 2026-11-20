@@ -30,7 +30,7 @@ export const createIdentityHandlers = db => ({
         if (!invite) throw new Error('Invalid invitation');
         await tx.insert(profiles).values({
           id: event.user.id, username: invite.username, role: invite.role,
-          divisions: invite.divisions, displayName: invite.username,
+          divisions: invite.divisions, rosterTitle: invite.rosterTitle, permissions: invite.permissions, displayName: invite.username,
         });
       });
       return { user: cleanUser(event.user) };
