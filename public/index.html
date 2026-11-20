@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a1425">
+  <meta name="description" content="Team YVO — Rocket League players, freestylers, editors and designers. Meet the roster and catch the latest clips.">
+  <title>Team YVO — Built for the game</title>
+  <link rel="icon" type="image/png" href="/assets/yvo-mark.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800;900&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip" href="#app">Skip to content</a>
+  <header><nav id="nav" aria-label="Main navigation"><a class="logo" href="#/"><img src="/assets/yvo-mark.png" alt="Team YVO"><span>TEAM <b>YVO</b></span></a><a href="#/roster">Roster</a><a href="#/login">Log in</a></nav></header>
+  <main id="app" tabindex="-1"><div class="loading-state" aria-live="polite">Loading Team YVO…</div></main>
+  <footer><a class="logo" href="#/"><img src="/assets/yvo-mark.png" alt=""><span>TEAM <b>YVO</b></span></a><span>Players. Creators. One team.</span><a href="https://www.tiktok.com/@teamyvo" target="_blank" rel="noopener noreferrer">@teamyvo ↗</a></footer>
+  <dialog id="modal" aria-labelledby="modal-title"></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <noscript>Please enable JavaScript to use Team YVO.</noscript>
+  <script src="/config.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
