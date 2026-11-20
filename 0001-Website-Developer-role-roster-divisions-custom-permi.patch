@@ -1,0 +1,2894 @@
+From a2a1c0baf71bdc738fca84fead703afe28599f64 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 20 Nov 2026 02:08:14 +0000
+Subject: [PATCH] Website Developer role, roster divisions, custom permissions,
+ password settings, account recovery, Discord OAuth2 and invite
+
+---
+ .env.example                                  |    9 +
+ .gitignore                                    |    3 +
+ db/schema.ts                                  |   25 +
+ .../migration.sql                             |   43 +
+ .../snapshot.json                             | 1265 +++++++++++++++++
+ netlify/server/app.mjs                        |  238 +++-
+ netlify/server/identity-handlers.mjs          |    2 +-
+ netlify/server/permissions.mjs                |   91 +-
+ public/app.js                                 |  197 ++-
+ public/index.html                             |    2 +-
+ public/styles.css                             |    5 +
+ tests/database.integration.mjs                |  291 +++-
+ tests/permissions.test.mjs                    |   87 +-
+ tests/ui.browser.mjs                          |   52 +-
+ 14 files changed, 2120 insertions(+), 190 deletions(-)
+ create mode 100644 .env.example
+ create mode 100644 .gitignore
+ create mode 100644 netlify/database/migrations/20261120020042_team_roles_permissions_recovery_discord/migration.sql
+ create mode 100644 netlify/database/migrations/20261120020042_team_roles_permissions_recovery_discord/snapshot.json
+
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..a3bf864
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,9 @@
++# Set these in Netlify > Site configuration > Environment variables (never commit real values).
++# Discord OAuth2 (https://discord.com/developers/applications). Redirect URI to register:
++#   https://teamyvo.netlify.app/api/discord/callback
++DISCORD_CLIENT_ID=
++DISCORD_CLIENT_SECRET=
++# Optional: only if the redirect URI differs from <site URL>/api/discord/callback
++DISCORD_REDIRECT_URI=
++# Optional: needed only to reset the two older (Supabase) accounts; keep it server-side only.
++SUPABASE_SERVICE_ROLE_KEY=
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..281417e
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,3 @@
++node_modules/
++.env
++.netlify/
+diff --git a/db/schema.ts b/db/schema.ts
+index 8079727..cc0e627 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -6,6 +6,12 @@ export const profiles = pgTable('profiles', {
+   provider: text('provider').notNull().default('identity'),
+   role: text('role').notNull().default('member'),
+   divisions: text('divisions').array().notNull().default([]),
++  // Organizational title only (owner, co-owner, ...). It never grants any permission.
++  rosterTitle: text('roster_title').notNull().default(''),
++  // Individually granted feature permissions, assigned only by Website Developers.
++  permissions: text('permissions').array().notNull().default([]),
++  discordId: text('discord_id').unique(),
++  discordUsername: text('discord_username').notNull().default(''),
+   displayName: text('display_name').notNull().default(''),
+   title: text('title').notNull().default(''),
+   bio: text('bio').notNull().default(''),
+@@ -20,6 +26,8 @@ export const invites = pgTable('invites', {
+   username: text('username').notNull().unique(),
+   role: text('role').notNull(),
+   divisions: text('divisions').array().notNull().default([]),
++  rosterTitle: text('roster_title').notNull().default(''),
++  permissions: text('permissions').array().notNull().default([]),
+   expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+   claimedAt: timestamp('claimed_at', { withTimezone: true, mode: 'string' }),
+ });
+@@ -28,6 +36,7 @@ export const rosterMembers = pgTable('roster_members', {
+   displayName: text('display_name').notNull(),
+   title: text('title').notNull().default(''),
+   division: text('division').notNull(),
++  rosterTitle: text('roster_title').notNull().default(''),
+   avatarUrl: text('avatar_url').notNull().default(''),
+   sort: integer('sort').notNull().default(0),
+ });
+@@ -61,3 +70,19 @@ export const claimAttempts = pgTable('claim_attempts', {
+   key: text('key').primaryKey(), attempts: integer('attempts').notNull().default(1),
+   windowStart: timestamp('window_start', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+ });
++export const recoveryTokens = pgTable('recovery_tokens', {
++  id: text('id').primaryKey(),
++  profileId: text('profile_id').notNull().references(() => profiles.id),
++  tokenHash: text('token_hash').notNull().unique(),
++  createdBy: text('created_by').notNull(),
++  createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
++  expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
++  // Set when the token is used or replaced by a newer one.
++  usedAt: timestamp('used_at', { withTimezone: true, mode: 'string' }),
++}, (t) => [index('recovery_tokens_profile_idx').on(t.profileId)]);
++export const oauthStates = pgTable('oauth_states', {
++  stateHash: text('state_hash').primaryKey(),
++  profileId: text('profile_id').notNull().references(() => profiles.id),
++  expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
++  usedAt: timestamp('used_at', { withTimezone: true, mode: 'string' }),
++});
+diff --git a/netlify/database/migrations/20261120020042_team_roles_permissions_recovery_discord/migration.sql b/netlify/database/migrations/20261120020042_team_roles_permissions_recovery_discord/migration.sql
+new file mode 100644
+index 0000000..3dde024
+--- /dev/null
++++ b/netlify/database/migrations/20261120020042_team_roles_permissions_recovery_discord/migration.sql
+@@ -0,0 +1,43 @@
++CREATE TABLE "oauth_states" (
++	"state_hash" text PRIMARY KEY,
++	"profile_id" text NOT NULL,
++	"expires_at" timestamp with time zone NOT NULL,
++	"used_at" timestamp with time zone
++);
++--> statement-breakpoint
++CREATE TABLE "recovery_tokens" (
++	"id" text PRIMARY KEY,
++	"profile_id" text NOT NULL,
++	"token_hash" text NOT NULL UNIQUE,
++	"created_by" text NOT NULL,
++	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
++	"expires_at" timestamp with time zone NOT NULL,
++	"used_at" timestamp with time zone
++);
++--> statement-breakpoint
++ALTER TABLE "invites" ADD COLUMN "roster_title" text DEFAULT '' NOT NULL;--> statement-breakpoint
++ALTER TABLE "invites" ADD COLUMN "permissions" text[] DEFAULT '{}'::text[] NOT NULL;--> statement-breakpoint
++ALTER TABLE "profiles" ADD COLUMN "roster_title" text DEFAULT '' NOT NULL;--> statement-breakpoint
++ALTER TABLE "profiles" ADD COLUMN "permissions" text[] DEFAULT '{}'::text[] NOT NULL;--> statement-breakpoint
++ALTER TABLE "profiles" ADD COLUMN "discord_id" text;--> statement-breakpoint
++ALTER TABLE "profiles" ADD COLUMN "discord_username" text DEFAULT '' NOT NULL;--> statement-breakpoint
++ALTER TABLE "roster_members" ADD COLUMN "roster_title" text DEFAULT '' NOT NULL;--> statement-breakpoint
++ALTER TABLE "profiles" ADD CONSTRAINT "profiles_discord_id_key" UNIQUE("discord_id");--> statement-breakpoint
++CREATE INDEX "recovery_tokens_profile_idx" ON "recovery_tokens" ("profile_id");--> statement-breakpoint
++ALTER TABLE "oauth_states" ADD CONSTRAINT "oauth_states_profile_id_profiles_id_fkey" FOREIGN KEY ("profile_id") REFERENCES "profiles"("id");--> statement-breakpoint
++ALTER TABLE "recovery_tokens" ADD CONSTRAINT "recovery_tokens_profile_id_profiles_id_fkey" FOREIGN KEY ("profile_id") REFERENCES "profiles"("id");--> statement-breakpoint
++-- DATA MIGRATION (no rows are deleted). Roster titles are organizational only and grant nothing.
++-- Keep each person's current roster appearance by recording the old role as their roster title first.
++UPDATE "profiles" SET "roster_title" = "role" WHERE "role" IN ('owner', 'co-owner', 'admin') AND "roster_title" = '';--> statement-breakpoint
++UPDATE "invites" SET "roster_title" = "role" WHERE "role" IN ('owner', 'co-owner', 'admin') AND "roster_title" = '';--> statement-breakpoint
++-- Owner becomes Website Developer (highest system role). Co-Owner is removed as a system role;
++-- existing co-owner accounts keep their previous admin-level access and keep Co-Owner as a roster title.
++UPDATE "profiles" SET "role" = 'website-developer' WHERE "role" = 'owner';--> statement-breakpoint
++UPDATE "profiles" SET "role" = 'admin' WHERE "role" = 'co-owner';--> statement-breakpoint
++UPDATE "invites" SET "role" = 'website-developer' WHERE "role" = 'owner';--> statement-breakpoint
++UPDATE "invites" SET "role" = 'admin' WHERE "role" = 'co-owner';--> statement-breakpoint
++UPDATE "resources" SET "min_role" = 'website-developer' WHERE "min_role" = 'owner';--> statement-breakpoint
++UPDATE "resources" SET "min_role" = 'admin' WHERE "min_role" = 'co-owner';--> statement-breakpoint
++-- Roster groups become Leadership / Administration / Staff (plus the existing content divisions).
++UPDATE "roster_members" SET "roster_title" = "division", "division" = 'leadership' WHERE "division" IN ('owner', 'co-owner');--> statement-breakpoint
++UPDATE "roster_members" SET "roster_title" = 'admin', "division" = 'administration' WHERE "division" = 'admin';
+diff --git a/netlify/database/migrations/20261120020042_team_roles_permissions_recovery_discord/snapshot.json b/netlify/database/migrations/20261120020042_team_roles_permissions_recovery_discord/snapshot.json
+new file mode 100644
+index 0000000..5cb14b9
+--- /dev/null
++++ b/netlify/database/migrations/20261120020042_team_roles_permissions_recovery_discord/snapshot.json
+@@ -0,0 +1,1265 @@
++{
++  "version": "8",
++  "dialect": "postgres",
++  "id": "5f81a3b5-8144-47f3-9c2c-d7878659c80d",
++  "prevIds": [
++    "6960ce00-5229-44ec-8256-5cb497b1876c"
++  ],
++  "ddl": [
++    {
++      "isRlsEnabled": false,
++      "name": "announcements",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "audit_log",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "claim_attempts",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "invites",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "messages",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "oauth_states",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "profiles",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "recovery_tokens",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "resources",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "roster_members",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "isRlsEnabled": false,
++      "name": "tiktok_posts",
++      "entityType": "tables",
++      "schema": "public"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "announcements"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "body",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "announcements"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "now()",
++      "generated": null,
++      "identity": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "announcements"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "audit_log"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "actor_id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "audit_log"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "action",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "audit_log"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": false,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "target_id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "audit_log"
++    },
++    {
++      "type": "jsonb",
++      "typeSchema": null,
++      "notNull": false,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "details",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "audit_log"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "now()",
++      "generated": null,
++      "identity": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "audit_log"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "key",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "claim_attempts"
++    },
++    {
++      "type": "integer",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "1",
++      "generated": null,
++      "identity": null,
++      "name": "attempts",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "claim_attempts"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "now()",
++      "generated": null,
++      "identity": null,
++      "name": "window_start",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "claim_attempts"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "token_hash",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "username",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "role",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 1,
++      "default": "'{}'",
++      "generated": null,
++      "identity": null,
++      "name": "divisions",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "roster_title",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 1,
++      "default": "'{}'",
++      "generated": null,
++      "identity": null,
++      "name": "permissions",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "expires_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": false,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "claimed_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "invites"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "messages"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "channel",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "messages"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "user_id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "messages"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "username",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "messages"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "body",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "messages"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "now()",
++      "generated": null,
++      "identity": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "messages"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "state_hash",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "oauth_states"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "profile_id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "oauth_states"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "expires_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "oauth_states"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": false,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "used_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "oauth_states"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "username",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "'identity'",
++      "generated": null,
++      "identity": null,
++      "name": "provider",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "'member'",
++      "generated": null,
++      "identity": null,
++      "name": "role",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 1,
++      "default": "'{}'",
++      "generated": null,
++      "identity": null,
++      "name": "divisions",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "roster_title",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 1,
++      "default": "'{}'",
++      "generated": null,
++      "identity": null,
++      "name": "permissions",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": false,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "discord_id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "discord_username",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "display_name",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "title",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "bio",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "avatar_url",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": false,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "timeout_until",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "boolean",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "false",
++      "generated": null,
++      "identity": null,
++      "name": "deleted",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "now()",
++      "generated": null,
++      "identity": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "profiles"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "profile_id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "token_hash",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "created_by",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "now()",
++      "generated": null,
++      "identity": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "expires_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": false,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "used_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "resources"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "title",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "resources"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "url",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "resources"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "'member'",
++      "generated": null,
++      "identity": null,
++      "name": "min_role",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "resources"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": false,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "division",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "resources"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "roster_members"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "display_name",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "roster_members"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "title",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "roster_members"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "division",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "roster_members"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "roster_title",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "roster_members"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "avatar_url",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "roster_members"
++    },
++    {
++      "type": "integer",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "0",
++      "generated": null,
++      "identity": null,
++      "name": "sort",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "roster_members"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "id",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "tiktok_posts"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "share_url",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "tiktok_posts"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "cover_url",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "tiktok_posts"
++    },
++    {
++      "type": "text",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": "''",
++      "generated": null,
++      "identity": null,
++      "name": "title",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "tiktok_posts"
++    },
++    {
++      "type": "timestamp with time zone",
++      "typeSchema": null,
++      "notNull": true,
++      "dimensions": 0,
++      "default": null,
++      "generated": null,
++      "identity": null,
++      "name": "posted_at",
++      "entityType": "columns",
++      "schema": "public",
++      "table": "tiktok_posts"
++    },
++    {
++      "nameExplicit": true,
++      "columns": [
++        {
++          "value": "channel",
++          "isExpression": false,
++          "asc": true,
++          "nullsFirst": false,
++          "opclass": null
++        },
++        {
++          "value": "created_at",
++          "isExpression": false,
++          "asc": true,
++          "nullsFirst": false,
++          "opclass": null
++        }
++      ],
++      "isUnique": false,
++      "where": null,
++      "with": "",
++      "method": "btree",
++      "concurrently": false,
++      "name": "messages_channel_created_idx",
++      "entityType": "indexes",
++      "schema": "public",
++      "table": "messages"
++    },
++    {
++      "nameExplicit": true,
++      "columns": [
++        {
++          "value": "profile_id",
++          "isExpression": false,
++          "asc": true,
++          "nullsFirst": false,
++          "opclass": null
++        }
++      ],
++      "isUnique": false,
++      "where": null,
++      "with": "",
++      "method": "btree",
++      "concurrently": false,
++      "name": "recovery_tokens_profile_idx",
++      "entityType": "indexes",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "nameExplicit": false,
++      "columns": [
++        "user_id"
++      ],
++      "schemaTo": "public",
++      "tableTo": "profiles",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "name": "messages_user_id_profiles_id_fkey",
++      "entityType": "fks",
++      "schema": "public",
++      "table": "messages"
++    },
++    {
++      "nameExplicit": false,
++      "columns": [
++        "profile_id"
++      ],
++      "schemaTo": "public",
++      "tableTo": "profiles",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "name": "oauth_states_profile_id_profiles_id_fkey",
++      "entityType": "fks",
++      "schema": "public",
++      "table": "oauth_states"
++    },
++    {
++      "nameExplicit": false,
++      "columns": [
++        "profile_id"
++      ],
++      "schemaTo": "public",
++      "tableTo": "profiles",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "name": "recovery_tokens_profile_id_profiles_id_fkey",
++      "entityType": "fks",
++      "schema": "public",
++      "table": "recovery_tokens"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "announcements_pkey",
++      "schema": "public",
++      "table": "announcements",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "audit_log_pkey",
++      "schema": "public",
++      "table": "audit_log",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "key"
++      ],
++      "nameExplicit": false,
++      "name": "claim_attempts_pkey",
++      "schema": "public",
++      "table": "claim_attempts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "invites_pkey",
++      "schema": "public",
++      "table": "invites",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "messages_pkey",
++      "schema": "public",
++      "table": "messages",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "state_hash"
++      ],
++      "nameExplicit": false,
++      "name": "oauth_states_pkey",
++      "schema": "public",
++      "table": "oauth_states",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "profiles_pkey",
++      "schema": "public",
++      "table": "profiles",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "recovery_tokens_pkey",
++      "schema": "public",
++      "table": "recovery_tokens",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "resources_pkey",
++      "schema": "public",
++      "table": "resources",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "roster_members_pkey",
++      "schema": "public",
++      "table": "roster_members",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "tiktok_posts_pkey",
++      "schema": "public",
++      "table": "tiktok_posts",
++      "entityType": "pks"
++    },
++    {
++      "nameExplicit": false,
++      "columns": [
++        "token_hash"
++      ],
++      "nullsNotDistinct": false,
++      "name": "invites_token_hash_key",
++      "schema": "public",
++      "table": "invites",
++      "entityType": "uniques"
++    },
++    {
++      "nameExplicit": false,
++      "columns": [
++        "username"
++      ],
++      "nullsNotDistinct": false,
++      "name": "invites_username_key",
++      "schema": "public",
++      "table": "invites",
++      "entityType": "uniques"
++    },
++    {
++      "nameExplicit": false,
++      "columns": [
++        "username"
++      ],
++      "nullsNotDistinct": false,
++      "name": "profiles_username_key",
++      "schema": "public",
++      "table": "profiles",
++      "entityType": "uniques"
++    },
++    {
++      "nameExplicit": false,
++      "columns": [
++        "discord_id"
++      ],
++      "nullsNotDistinct": false,
++      "name": "profiles_discord_id_key",
++      "schema": "public",
++      "table": "profiles",
++      "entityType": "uniques"
++    },
++    {
++      "nameExplicit": false,
++      "columns": [
++        "token_hash"
++      ],
++      "nullsNotDistinct": false,
++      "name": "recovery_tokens_token_hash_key",
++      "schema": "public",
++      "table": "recovery_tokens",
++      "entityType": "uniques"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/netlify/server/app.mjs b/netlify/server/app.mjs
+index f492471..0018b1a 100644
+--- a/netlify/server/app.mjs
++++ b/netlify/server/app.mjs
+@@ -1,16 +1,42 @@
+ import { Hono } from 'hono';
+ import { bodyLimit } from 'hono/body-limit';
+-import { createHash, randomBytes, randomUUID } from 'node:crypto';
++import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
++import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+ import { readFileSync } from 'node:fs';
+ import vm from 'node:vm';
+ import { and, eq, desc, asc, gt, isNull, sql } from 'drizzle-orm';
+ import * as t from '../../db/schema.ts';
+ import {
+-  DIVISIONS, ROLES, ROSTER_GROUPS, rank, HttpError, requireRole, requireOwner,
+-  requireChannel, requireCanMessage, requireCanModerate, requireProfileEdit, publicProfile,
++  DIVISIONS, ROLES, ROSTER_GROUPS, TITLE_DIVISION, DEVELOPER, rank, HttpError, can, isDeveloper, effectivePermissions,
++  requireRole, requireDeveloper, requirePermission, requireManager, requireChannel, requireCanMessage, requireCanModerate,
++  requireProfileEdit, cleanPermissions, cleanRosterTitle, publicProfile, selfProfile, managerProfile,
+ } from './permissions.mjs';
+ 
+-export function createApp({ database, authenticateUser = null }) {
++const RECOVERY_HOURS = 24;
++const PASSWORD_RULE = 'Use a password of 8 to 128 characters.';
++
++// Sets a password on the sign-in provider. Passwords are never stored by this app.
++function providerPasswords(legacy) {
++  return {
++    supports: profile => profile.provider !== 'legacy' || !!process.env.SUPABASE_SERVICE_ROLE_KEY,
++    async set(profile, password) {
++      if (profile.provider === 'legacy') {
++        const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
++        if (!key) throw new HttpError(503, 'Resets for this older account are not configured yet.');
++        const response = await fetch(legacy.SUPABASE_URL + '/auth/v1/admin/users/' + encodeURIComponent(profile.id), {
++          method: 'PUT', headers: { apikey: key, Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
++          body: JSON.stringify({ password }), signal: AbortSignal.timeout(8000),
++        });
++        if (!response.ok) throw new HttpError(502, 'Could not update the password. Please try again.');
++        return;
++      }
++      try { const { admin } = await import('@netlify/identity'); await admin.updateUser(profile.id, { password }); }
++      catch { throw new HttpError(502, 'Could not update the password. Please try again.'); }
++    },
++  };
++}
++
++export function createApp({ database, authenticateUser = null, passwords = null, fetchImpl = fetch }) {
+ const db = database;
+ // Keep the two existing accounts working. All authorization and application data now live here.
+ const sandbox = { window: {} };
+@@ -19,6 +45,8 @@ const legacy = sandbox.window.YVO;
+ const app = new Hono();
+ const allowedOrigins = new Set(['https://teamyvo.netlify.app', ...['URL', 'DEPLOY_URL', 'DEPLOY_PRIME_URL'].map(key => process.env[key]).filter(Boolean)].map(value => new URL(value).origin));
+ if (process.env.NETLIFY_DEV === 'true') { allowedOrigins.add('http://localhost:8889'); allowedOrigins.add('http://127.0.0.1:8889'); }
++const sha = value => createHash('sha256').update(String(value)).digest('hex');
++const sameSecret = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && timingSafeEqual(x, y); };
+ const hash = value => createHash('sha256').update(value.trim().toUpperCase()).digest('hex');
+ const text = (value, max = 200) => String(value ?? '').trim().slice(0, max);
+ const listDivisions = value => [...new Set(Array.isArray(value) ? value : [])].filter(d => DIVISIONS.includes(d));
+@@ -28,9 +56,17 @@ const validUrl = (value, optional = false) => {
+   catch { throw new HttpError(400, 'Enter a valid http or https URL.'); }
+ };
+ const profileById = async id => (await db.select().from(t.profiles).where(eq(t.profiles.id, text(id))).limit(1))[0];
+-const audit = (tx, actor, action, targetId = null) => tx.insert(t.auditLog).values({
+-  id: randomUUID(), actorId: actor.id, action, targetId,
++const audit = (tx, actor, action, targetId = null, details = null) => tx.insert(t.auditLog).values({
++  id: randomUUID(), actorId: actor.id, action, targetId, details,
+ });
++const sameSet = (a = [], b = []) => a.length === b.length && a.every(x => b.includes(x));
++passwords ??= providerPasswords(legacy);
++const primaryOrigin = () => new URL(process.env.URL || 'https://teamyvo.netlify.app').origin;
++// Discord credentials stay in server environment variables and are never sent to the browser.
++const discordConfig = () => {
++  const id = process.env.DISCORD_CLIENT_ID, secret = process.env.DISCORD_CLIENT_SECRET;
++  return id && secret ? { id, secret, redirect: process.env.DISCORD_REDIRECT_URI || primaryOrigin() + '/api/discord/callback' } : null;
++};
+ 
+ app.use('/api/*', bodyLimit({ maxSize: 16000, onError: c => c.json({ error: 'Request is too large.' }, 413) }));
+ app.use('/api/*', async (c, next) => {
+@@ -73,12 +109,10 @@ app.get('/api/public', async c => {
+   return c.json({ roster, members: members.map(publicProfile), posts });
+ });
+ 
+-app.get('/api/me', async c => c.json({ me: await authenticate(c) }));
++app.get('/api/me', async c => { const me = await authenticate(c); return c.json({ me: me ? selfProfile(me) : null }); });
+ 
+ // Failed activations are limited persistently, across cold starts and instances.
+-app.post('/api/prepare-claim', async c => {
+-  const { token } = await c.req.json();
+-  if (typeof token !== 'string' || token.length > 100) throw new HttpError(400, 'Enter your activation token.');
++async function limitClaims(c) {
+   const ip = c.req.header('x-nf-client-connection-ip') || c.req.header('x-forwarded-for')?.split(',')[0] || 'unknown';
+   const key = hash('claim:' + ip);
+   const [attempt] = await db.insert(t.claimAttempts).values({ key }).onConflictDoUpdate({
+@@ -89,11 +123,88 @@ app.post('/api/prepare-claim', async c => {
+     },
+   }).returning();
+   if (attempt.attempts > 8) throw new HttpError(429, 'Too many attempts. Try again in 10 minutes.');
++}
++app.post('/api/prepare-claim', async c => {
++  const { token } = await c.req.json();
++  if (typeof token !== 'string' || token.length > 100) throw new HttpError(400, 'Enter your activation token.');
++  await limitClaims(c);
+   const [invite] = await db.select().from(t.invites).where(and(
+     eq(t.invites.tokenHash, hash(token)), isNull(t.invites.claimedAt), gt(t.invites.expiresAt, new Date().toISOString()),
+   )).limit(1);
+-  if (!invite) throw new HttpError(400, 'Invalid or expired activation token.');
+-  return c.json({ username: invite.username });
++  if (invite) return c.json({ username: invite.username, mode: 'activate' });
++  const [recovery] = await db.select({ username: t.profiles.username }).from(t.recoveryTokens)
++    .innerJoin(t.profiles, eq(t.profiles.id, t.recoveryTokens.profileId)).where(and(
++      eq(t.recoveryTokens.tokenHash, hash(token)), isNull(t.recoveryTokens.usedAt),
++      gt(t.recoveryTokens.expiresAt, new Date().toISOString()), eq(t.profiles.deleted, false),
++    )).limit(1);
++  if (!recovery) throw new HttpError(400, 'Invalid or expired activation token.');
++  return c.json({ username: recovery.username, mode: 'recover' });
++});
++
++// Reactivates an EXISTING account with a single-use recovery token: same username, roster entry and data.
++app.post('/api/complete-recovery', async c => {
++  const { token, password } = await c.req.json();
++  if (typeof token !== 'string' || token.length > 100) throw new HttpError(400, 'Enter your activation token.');
++  if (typeof password !== 'string' || password.length < 8 || password.length > 128) throw new HttpError(400, PASSWORD_RULE);
++  await limitClaims(c);
++  const username = await db.transaction(async tx => {
++    // Consuming the token first makes concurrent redemptions impossible; a failure below rolls this back.
++    const [used] = await tx.update(t.recoveryTokens).set({ usedAt: new Date().toISOString() }).where(and(
++      eq(t.recoveryTokens.tokenHash, hash(token)), isNull(t.recoveryTokens.usedAt), gt(t.recoveryTokens.expiresAt, new Date().toISOString()),
++    )).returning();
++    if (!used) throw new HttpError(400, 'Invalid or expired activation token.');
++    const [profile] = await tx.select().from(t.profiles).where(eq(t.profiles.id, used.profileId)).for('update');
++    if (!profile || profile.deleted) throw new HttpError(400, 'Invalid or expired activation token.');
++    await passwords.set(profile, password);
++    await audit(tx, profile, 'accountRecovered', profile.id);
++    return profile.username;
++  });
++  return c.json({ ok: true, username });
++});
++
++// Discord OAuth2 callback. The user is identified by a single-use state bound to a browser cookie.
++app.get('/api/discord/callback', async c => {
++  const cookieOptions = { path: '/api/discord', secure: true, httpOnly: true, sameSite: 'Lax' };
++  const finish = status => { deleteCookie(c, 'yvo_discord_state', cookieOptions); return c.redirect('/?discord=' + status + '#/hub', 302); };
++  const cfg = discordConfig(), { code, state, error } = c.req.query(), cookie = getCookie(c, 'yvo_discord_state');
++  if (!cfg) return finish('error');
++  if (typeof state !== 'string' || state.length > 200 || !cookie || !sameSecret(cookie, state)) return finish('invalid');
++  const [row] = await db.update(t.oauthStates).set({ usedAt: new Date().toISOString() }).where(and(
++    eq(t.oauthStates.stateHash, sha(state)), isNull(t.oauthStates.usedAt), gt(t.oauthStates.expiresAt, new Date().toISOString()),
++  )).returning();
++  if (!row) return finish('invalid');
++  if (error) return finish('denied');
++  if (typeof code !== 'string' || !code || code.length > 512) return finish('invalid');
++  try {
++    const basic = Buffer.from(cfg.id + ':' + cfg.secret).toString('base64');
++    const tokenResponse = await fetchImpl('https://discord.com/api/oauth2/token', {
++      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: 'Basic ' + basic },
++      body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: cfg.redirect }), signal: AbortSignal.timeout(8000),
++    });
++    if (!tokenResponse.ok) return finish('error');
++    const { access_token: accessToken } = await tokenResponse.json();
++    if (typeof accessToken !== 'string') return finish('error');
++    const userResponse = await fetchImpl('https://discord.com/api/users/@me', { headers: { Authorization: 'Bearer ' + accessToken }, signal: AbortSignal.timeout(8000) });
++    // The token is only needed once; revoke it on a best-effort basis.
++    fetchImpl('https://discord.com/api/oauth2/token/revoke', {
++      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: 'Basic ' + basic },
++      body: new URLSearchParams({ token: accessToken, token_type_hint: 'access_token' }), signal: AbortSignal.timeout(5000),
++    }).catch(() => {});
++    if (!userResponse.ok) return finish('error');
++    const account = await userResponse.json();
++    if (!/^\d{15,25}$/.test(String(account.id))) return finish('error');
++    const username = text(account.username, 80);
++    return await db.transaction(async tx => {
++      const [profile] = await tx.select().from(t.profiles).where(eq(t.profiles.id, row.profileId)).for('update');
++      if (!profile || profile.deleted) return finish('invalid');
++      if (profile.discordId && profile.discordId !== account.id) return finish('already-linked');
++      const [owner] = await tx.select({ id: t.profiles.id }).from(t.profiles).where(eq(t.profiles.discordId, account.id));
++      if (owner && owner.id !== profile.id) return finish('duplicate');
++      await tx.update(t.profiles).set({ discordId: account.id, discordUsername: username }).where(eq(t.profiles.id, profile.id));
++      await audit(tx, profile, 'discordLinked', profile.id);
++      return finish('linked');
++    });
++  } catch (e) { return finish(e?.cause?.code === '23505' || e?.code === '23505' ? 'duplicate' : 'error'); }
+ });
+ 
+ app.use('/api/action', async (c, next) => { c.set('me', await authenticate(c)); requireRole(c.get('me'), 'member'); await next(); });
+@@ -104,9 +215,9 @@ app.post('/api/action', async c => {
+       const [resources, announcements, moderationMembers] = await Promise.all([
+         db.select().from(t.resources).orderBy(t.resources.title),
+         db.select().from(t.announcements).orderBy(desc(t.announcements.createdAt)).limit(5),
+-        rank(me.role) >= 2 ? db.select({ id: t.profiles.id, username: t.profiles.username, role: t.profiles.role, timeoutUntil: t.profiles.timeoutUntil }).from(t.profiles).where(eq(t.profiles.deleted, false)).orderBy(t.profiles.username) : [],
++        can(me, 'chat.moderate') ? db.select({ id: t.profiles.id, username: t.profiles.username, role: t.profiles.role, timeoutUntil: t.profiles.timeoutUntil }).from(t.profiles).where(eq(t.profiles.deleted, false)).orderBy(t.profiles.username) : [],
+       ]);
+-      return c.json({ resources: resources.filter(r => rank(me.role) >= rank(r.minRole) && (!r.division || rank(me.role) >= 2 || me.divisions.includes(r.division))), announcements, moderationMembers, me });
++      return c.json({ resources: resources.filter(r => rank(me.role) >= rank(r.minRole) && (!r.division || can(me, 'divisions.all') || me.divisions.includes(r.division))), announcements, moderationMembers, me: selfProfile(me) });
+     }
+     case 'messages': {
+       requireChannel(me, p.channel);
+@@ -126,7 +237,7 @@ app.post('/api/action', async c => {
+       return c.json({ ok: true });
+     }
+     case 'deleteMessage': {
+-      requireRole(me, 'staff');
++      requirePermission(me, 'chat.moderate');
+       const [message] = await db.select().from(t.messages).where(eq(t.messages.id, text(p.id)));
+       if (!message) throw new HttpError(404, 'Message not found.');
+       requireChannel(me, message.channel);
+@@ -145,61 +256,108 @@ app.post('/api/action', async c => {
+       return c.json({ ok: true, timeoutUntil });
+     }
+     case 'adminData': {
+-      requireRole(me, 'admin');
++      requireManager(me);
++      const dev = isDeveloper(me), none = Promise.resolve([]);
+       const [members, roster, resources, announcements, posts, invites] = await Promise.all([
+-        db.select().from(t.profiles).where(eq(t.profiles.deleted, false)).orderBy(t.profiles.username),
+-        db.select().from(t.rosterMembers).orderBy(t.rosterMembers.sort, t.rosterMembers.displayName),
+-        db.select().from(t.resources), db.select().from(t.announcements).orderBy(desc(t.announcements.createdAt)),
+-        db.select().from(t.tiktokPosts).orderBy(desc(t.tiktokPosts.postedAt)),
+-        me.role === 'owner' ? db.select({ id: t.invites.id, username: t.invites.username, role: t.invites.role, divisions: t.invites.divisions, expiresAt: t.invites.expiresAt }).from(t.invites).where(and(isNull(t.invites.claimedAt), gt(t.invites.expiresAt, new Date().toISOString()))) : [],
++        can(me, 'roster.manage') ? db.select().from(t.profiles).where(eq(t.profiles.deleted, false)).orderBy(t.profiles.username) : none,
++        can(me, 'roster.manage') ? db.select().from(t.rosterMembers).orderBy(t.rosterMembers.sort, t.rosterMembers.displayName) : none,
++        can(me, 'vault.manage') ? db.select().from(t.resources) : none,
++        can(me, 'announcements.manage') ? db.select().from(t.announcements).orderBy(desc(t.announcements.createdAt)) : none,
++        can(me, 'tiktok.manage') ? db.select().from(t.tiktokPosts).orderBy(desc(t.tiktokPosts.postedAt)) : none,
++        dev ? db.select({ id: t.invites.id, username: t.invites.username, role: t.invites.role, rosterTitle: t.invites.rosterTitle, permissions: t.invites.permissions, divisions: t.invites.divisions, expiresAt: t.invites.expiresAt }).from(t.invites).where(and(isNull(t.invites.claimedAt), gt(t.invites.expiresAt, new Date().toISOString()))) : none,
+       ]);
+-      return c.json({ members, roster, resources, announcements, posts, invites });
++      return c.json({ members: members.map(m => managerProfile(m, me)), roster, resources, announcements, posts, invites, can: effectivePermissions(me) });
+     }
+     case 'createInvite': {
+-      requireOwner(me);
++      requireDeveloper(me);
+       const username = text(p.username).toLowerCase();
+       if (!/^[a-z0-9_]{3,20}$/.test(username)) throw new HttpError(400, 'Username must be 3–20 letters, numbers or underscores.');
+       if (!ROLES.includes(p.role)) throw new HttpError(400, 'Choose a valid role.');
+       const [existing] = await db.select({ id: t.profiles.id }).from(t.profiles).where(eq(t.profiles.username, username));
+       if (existing) throw new HttpError(409, 'That username is already taken.');
++      const rosterTitle = cleanRosterTitle(p.rosterTitle), permissions = cleanPermissions(p.permissions ?? []);
+       const token = 'YVO-' + randomBytes(16).toString('hex').toUpperCase();
+-      await db.insert(t.invites).values({ id: randomUUID(), tokenHash: hash(token), username, role: p.role, divisions: listDivisions(p.divisions), expiresAt: new Date(Date.now() + 7 * 86400000).toISOString() });
++      await db.insert(t.invites).values({ id: randomUUID(), tokenHash: hash(token), username, role: p.role, rosterTitle, permissions, divisions: listDivisions(p.divisions), expiresAt: new Date(Date.now() + 7 * 86400000).toISOString() });
+       return c.json({ username, token });
+     }
+     case 'deleteInvite': {
+-      requireOwner(me); await db.delete(t.invites).where(eq(t.invites.id, text(p.id))); return c.json({ ok: true });
++      requireDeveloper(me); await db.delete(t.invites).where(eq(t.invites.id, text(p.id))); return c.json({ ok: true });
+     }
+     case 'updateProfile': {
+       const target = await profileById(p.id), nextRole = p.role ?? target?.role;
+       requireProfileEdit(me, target, nextRole);
++      // Roster titles and explicit permissions are separate from roles, and only Website Developers can change them.
++      const nextTitle = p.rosterTitle === undefined ? target.rosterTitle : cleanRosterTitle(p.rosterTitle);
++      const nextPermissions = p.permissions === undefined ? target.permissions : cleanPermissions(p.permissions);
++      if (nextTitle !== target.rosterTitle || !sameSet(nextPermissions, target.permissions)) requireDeveloper(me);
++      await db.transaction(async tx => {
++        // Serialize developer-role changes so two requests cannot remove every Website Developer.
++        const developers = await tx.select().from(t.profiles).where(and(eq(t.profiles.role, DEVELOPER), eq(t.profiles.deleted, false))).for('update');
++        if (target.role === DEVELOPER && nextRole !== DEVELOPER && developers.length <= 1) throw new HttpError(400, 'Keep at least one Website Developer.');
++        await tx.update(t.profiles).set({ displayName: text(p.displayName, 50) || target.username, title: text(p.title, 80), bio: text(p.bio, 500), avatarUrl: validUrl(p.avatarUrl, true), divisions: listDivisions(p.divisions), role: nextRole, rosterTitle: nextTitle, permissions: nextPermissions }).where(eq(t.profiles.id, target.id));
++        const accessChanged = nextRole !== target.role || nextTitle !== target.rosterTitle || !sameSet(nextPermissions, target.permissions);
++        await audit(tx, me, accessChanged ? 'updateAccess' : 'updateProfile', target.id, accessChanged ? { role: nextRole, rosterTitle: nextTitle, permissions: nextPermissions } : null);
++      });
++      return c.json({ ok: true });
++    }
++    case 'resetAccount': {
++      requireDeveloper(me);
++      const target = await profileById(p.id);
++      if (!target || target.deleted) throw new HttpError(404, 'Member not found.');
++      if (target.id === me.id) throw new HttpError(400, 'Change your own password in Settings.');
++      if (!passwords.supports(target)) throw new HttpError(503, 'Resets for this older account are not configured yet. Add SUPABASE_SERVICE_ROLE_KEY in the site settings.');
++      const token = 'YVR-' + randomBytes(16).toString('hex').toUpperCase();
++      const expiresAt = new Date(Date.now() + RECOVERY_HOURS * 3600000).toISOString();
++      await db.transaction(async tx => {
++        await tx.select({ id: t.profiles.id }).from(t.profiles).where(eq(t.profiles.id, target.id)).for('update');
++        // Every earlier unused token for this account stops working.
++        await tx.update(t.recoveryTokens).set({ usedAt: new Date().toISOString() }).where(and(eq(t.recoveryTokens.profileId, target.id), isNull(t.recoveryTokens.usedAt)));
++        await tx.insert(t.recoveryTokens).values({ id: randomUUID(), profileId: target.id, tokenHash: hash(token), createdBy: me.id, expiresAt });
++        await audit(tx, me, 'resetAccount', target.id, { expiresAt });
++      });
++      return c.json({ username: target.username, token, expiresAt, reset: true });
++    }
++    case 'discordStart': {
++      const cfg = discordConfig();
++      if (!cfg) throw new HttpError(503, 'Discord linking is not set up yet.');
++      const state = randomBytes(32).toString('hex');
++      await db.delete(t.oauthStates).where(sql`${t.oauthStates.expiresAt} < now() - interval '1 hour'`);
++      await db.insert(t.oauthStates).values({ stateHash: sha(state), profileId: me.id, expiresAt: new Date(Date.now() + 10 * 60000).toISOString() });
++      setCookie(c, 'yvo_discord_state', state, { path: '/api/discord', secure: true, httpOnly: true, sameSite: 'Lax', maxAge: 600 });
++      const url = new URL('https://discord.com/oauth2/authorize');
++      for (const [k, v] of Object.entries({ response_type: 'code', client_id: cfg.id, scope: 'identify', redirect_uri: cfg.redirect, state, prompt: 'consent' })) url.searchParams.set(k, v);
++      return c.json({ url: url.href });
++    }
++    case 'discordDisconnect': {
+       await db.transaction(async tx => {
+-        // Serialize owner-role changes so two requests cannot remove every owner.
+-        const owners = await tx.select().from(t.profiles).where(and(eq(t.profiles.role, 'owner'), eq(t.profiles.deleted, false))).for('update');
+-        if (target.role === 'owner' && nextRole !== 'owner' && owners.length <= 1) throw new HttpError(400, 'Keep at least one owner.');
+-        await tx.update(t.profiles).set({ displayName: text(p.displayName, 50) || target.username, title: text(p.title, 80), bio: text(p.bio, 500), avatarUrl: validUrl(p.avatarUrl, true), divisions: listDivisions(p.divisions), role: nextRole }).where(eq(t.profiles.id, target.id));
+-        await audit(tx, me, 'updateProfile', target.id);
++        await tx.update(t.profiles).set({ discordId: null, discordUsername: '' }).where(eq(t.profiles.id, me.id));
++        await audit(tx, me, 'discordUnlinked', me.id);
+       });
+       return c.json({ ok: true });
+     }
+     case 'deleteMember': {
+-      requireOwner(me); const target = await profileById(p.id);
++      requireDeveloper(me); const target = await profileById(p.id);
+       if (!target || target.deleted) throw new HttpError(404, 'Member not found.');
+       if (target.id === me.id) throw new HttpError(400, 'You cannot delete your own account.');
+       await db.transaction(async tx => {
+-        const owners = await tx.select().from(t.profiles).where(and(eq(t.profiles.role, 'owner'), eq(t.profiles.deleted, false))).for('update');
+-        if (target.role === 'owner' && owners.length <= 1) throw new HttpError(400, 'Keep at least one owner.');
++        const developers = await tx.select().from(t.profiles).where(and(eq(t.profiles.role, DEVELOPER), eq(t.profiles.deleted, false))).for('update');
++        if (target.role === DEVELOPER && developers.length <= 1) throw new HttpError(400, 'Keep at least one Website Developer.');
+         await tx.delete(t.messages).where(eq(t.messages.userId, target.id));
+         // A tombstone rejects existing sessions and prevents legacy accounts from reappearing.
+-        await tx.update(t.profiles).set({ deleted: true, displayName: '', title: '', bio: '', avatarUrl: '', divisions: [], role: 'member', timeoutUntil: null }).where(eq(t.profiles.id, target.id));
++        await tx.update(t.profiles).set({ deleted: true, displayName: '', title: '', bio: '', avatarUrl: '', divisions: [], role: 'member', rosterTitle: '', permissions: [], discordId: null, discordUsername: '', timeoutUntil: null }).where(eq(t.profiles.id, target.id));
++        await tx.delete(t.recoveryTokens).where(eq(t.recoveryTokens.profileId, target.id));
++        await tx.delete(t.oauthStates).where(eq(t.oauthStates.profileId, target.id));
+         await tx.delete(t.invites).where(eq(t.invites.username, target.username));
+         await audit(tx, me, 'deleteMember', target.id);
+       });
+       return c.json({ ok: true });
+     }
+     case 'addRoster': case 'updateRoster': {
+-      requireRole(me, 'admin');
++      requirePermission(me, 'roster.manage');
+       if (!ROSTER_GROUPS.includes(p.division) || !text(p.displayName)) throw new HttpError(400, 'Add a name and choose a roster group.');
+-      const fields = { displayName: text(p.displayName, 50), title: text(p.title, 80), avatarUrl: validUrl(p.avatarUrl, true), division: p.division, sort: Math.max(-9999, Math.min(9999, Number(p.sort) || 0)) };
++      const rosterTitle = cleanRosterTitle(p.rosterTitle);
++      if (rosterTitle && TITLE_DIVISION[rosterTitle] !== p.division) throw new HttpError(400, 'That title does not belong to the chosen roster group.');
++      const fields = { rosterTitle, displayName: text(p.displayName, 50), title: text(p.title, 80), avatarUrl: validUrl(p.avatarUrl, true), division: p.division, sort: Math.max(-9999, Math.min(9999, Number(p.sort) || 0)) };
+       if (p.action === 'updateRoster') {
+         const rows = await db.update(t.rosterMembers).set(fields).where(eq(t.rosterMembers.id, text(p.id))).returning();
+         if (!rows.length) throw new HttpError(404, 'Roster entry not found.');
+@@ -207,17 +365,17 @@ app.post('/api/action', async c => {
+       return c.json({ ok: true });
+     }
+     case 'addResource': {
+-      requireRole(me, 'admin');
++      requirePermission(me, 'vault.manage');
+       if (!text(p.title) || !ROLES.includes(p.minRole)) throw new HttpError(400, 'Add a title and choose a minimum role.');
+       if (p.division && !DIVISIONS.includes(p.division)) throw new HttpError(400, 'Choose a valid division.');
+       await db.insert(t.resources).values({ id: randomUUID(), title: text(p.title), url: validUrl(p.url), minRole: p.minRole, division: p.division || null }); return c.json({ ok: true });
+     }
+     case 'announce': {
+-      requireRole(me, 'admin'); if (!text(p.body, 2000)) throw new HttpError(400, 'Write an announcement first.');
++      requirePermission(me, 'announcements.manage'); if (!text(p.body, 2000)) throw new HttpError(400, 'Write an announcement first.');
+       await db.insert(t.announcements).values({ id: randomUUID(), body: text(p.body, 2000) }); return c.json({ ok: true });
+     }
+     case 'addTikTok': {
+-      requireRole(me, 'admin');
++      requirePermission(me, 'tiktok.manage');
+       const url = validUrl(p.url), match = new URL(url).pathname.match(/^\/@teamyvo\/video\/(\d+)\/?$/);
+       if (new URL(url).hostname !== 'www.tiktok.com' || !match) throw new HttpError(400, 'Use a full video link from @teamyvo.');
+       const response = await fetch('https://www.tiktok.com/oembed?url=' + encodeURIComponent(url), { redirect: 'error', signal: AbortSignal.timeout(8000) });
+@@ -228,7 +386,7 @@ app.post('/api/action', async c => {
+       return c.json({ ok: true });
+     }
+     case 'deleteRoster': case 'deleteResource': case 'deleteAnnouncement': case 'deleteTikTok': {
+-      requireRole(me, 'admin');
++      requirePermission(me, { deleteRoster: 'roster.manage', deleteResource: 'vault.manage', deleteAnnouncement: 'announcements.manage', deleteTikTok: 'tiktok.manage' }[p.action]);
+       const table = { deleteRoster: t.rosterMembers, deleteResource: t.resources, deleteAnnouncement: t.announcements, deleteTikTok: t.tiktokPosts }[p.action];
+       await db.delete(table).where(eq(table.id, text(p.id))); return c.json({ ok: true });
+     }
+diff --git a/netlify/server/identity-handlers.mjs b/netlify/server/identity-handlers.mjs
+index a29abe4..fa56ac0 100644
+--- a/netlify/server/identity-handlers.mjs
++++ b/netlify/server/identity-handlers.mjs
+@@ -30,7 +30,7 @@ export const createIdentityHandlers = db => ({
+         if (!invite) throw new Error('Invalid invitation');
+         await tx.insert(profiles).values({
+           id: event.user.id, username: invite.username, role: invite.role,
+-          divisions: invite.divisions, displayName: invite.username,
++          divisions: invite.divisions, rosterTitle: invite.rosterTitle, permissions: invite.permissions, displayName: invite.username,
+         });
+       });
+       return { user: cleanUser(event.user) };
+diff --git a/netlify/server/permissions.mjs b/netlify/server/permissions.mjs
+index 089653a..7c04630 100644
+--- a/netlify/server/permissions.mjs
++++ b/netlify/server/permissions.mjs
+@@ -1,22 +1,65 @@
+ export const DIVISIONS = ['cch', 'fs', 'vfx', 'gfx', 'staff'];
+-export const ROLES = ['member', 'staff', 'admin', 'co-owner', 'owner'];
+-export const ROSTER_GROUPS = ['owner', 'co-owner', 'admin', ...DIVISIONS];
+-export const rank = role => ({ member: 1, staff: 2, admin: 3, 'co-owner': 4, owner: 5 })[role] || 0;
++
++// SYSTEM roles control what an account may do. Co-Owner is intentionally NOT a system role.
++export const ROLES = ['member', 'staff', 'admin', 'website-developer'];
++export const DEVELOPER = 'website-developer';
++export const rank = role => ({ member: 1, staff: 2, admin: 3, [DEVELOPER]: 4 })[role] || 0;
++
++// ROSTER titles and divisions are organizational labels ONLY. Nothing below ever reads them to grant access.
++export const ROSTER_TITLES = ['owner', 'co-owner', 'website-developer', 'admin', 'staff'];
++export const ROSTER_DIVISIONS = ['leadership', 'administration', 'staff'];
++export const ROSTER_GROUPS = [...ROSTER_DIVISIONS, 'cch', 'fs', 'vfx', 'gfx'];
++export const TITLE_DIVISION = { owner: 'leadership', 'co-owner': 'leadership', 'website-developer': 'leadership', admin: 'administration', staff: 'staff' };
++
++// Individually assignable feature permissions. Only a Website Developer can grant or change them.
++export const PERMISSIONS = {
++  'chat.moderate': 'Delete messages and time out members',
++  'divisions.all': 'Read and post in every division channel and vault',
++  'roster.manage': 'Manage member cards and roster entries',
++  'announcements.manage': 'Post and remove announcements',
++  'vault.manage': 'Add and remove team vault resources',
++  'tiktok.manage': 'Pin and remove TikTok videos',
++};
++export const PERMISSION_KEYS = Object.keys(PERMISSIONS);
++const MANAGE_KEYS = ['roster.manage', 'announcements.manage', 'vault.manage', 'tiktok.manage'];
++// Existing system-role behaviour is preserved as defaults. Explicit permissions only ADD to these.
++const ROLE_DEFAULTS = {
++  member: [],
++  staff: ['chat.moderate', 'divisions.all'],
++  admin: ['chat.moderate', 'divisions.all', ...MANAGE_KEYS],
++};
++
+ export class HttpError extends Error {
+   constructor(status, message) { super(message); this.status = status; }
+ }
++export const isDeveloper = user => !!user && !user.deleted && user.role === DEVELOPER;
++export function can(user, permission) {
++  if (!user || user.deleted) return false;
++  if (user.role === DEVELOPER) return true;
++  return (ROLE_DEFAULTS[user.role] || []).includes(permission) || (user.permissions || []).includes(permission);
++}
++export const effectivePermissions = user => (isDeveloper(user) ? PERMISSION_KEYS : PERMISSION_KEYS.filter(k => can(user, k)));
++export const canManageAny = user => MANAGE_KEYS.some(k => can(user, k));
+ export function requireRole(user, minimum) {
+   if (!user || user.deleted) throw new HttpError(401, 'Please log in again.');
+   if (rank(user.role) < rank(minimum)) throw new HttpError(403, 'You do not have permission for this action.');
+ }
+-export function requireOwner(user) {
++export function requirePermission(user, permission) {
++  requireRole(user, 'member');
++  if (!can(user, permission)) throw new HttpError(403, 'You do not have permission for this action.');
++}
++export function requireManager(user) {
++  requireRole(user, 'member');
++  if (!canManageAny(user)) throw new HttpError(403, 'You do not have permission for this action.');
++}
++export function requireDeveloper(user) {
+   requireRole(user, 'member');
+-  if (user.role !== 'owner') throw new HttpError(403, 'Only owners can do this.');
++  if (user.role !== DEVELOPER) throw new HttpError(403, 'Only Website Developers can do this.');
+ }
+ export function requireChannel(user, channel) {
+   requireRole(user, 'member');
+   if (!['general', 'tiktok', ...DIVISIONS].includes(channel)) throw new HttpError(404, 'Channel not found.');
+-  if (!['general', 'tiktok'].includes(channel) && rank(user.role) < rank('staff') && !user.divisions.includes(channel)) {
++  if (!['general', 'tiktok'].includes(channel) && !can(user, 'divisions.all') && !user.divisions.includes(channel)) {
+     throw new HttpError(403, 'This channel is for its division members.');
+   }
+ }
+@@ -27,21 +70,47 @@ export function requireCanMessage(user, channel) {
+   }
+ }
+ export function requireCanModerate(actor, target) {
+-  requireRole(actor, 'staff');
++  requirePermission(actor, 'chat.moderate');
+   if (!target || target.deleted) throw new HttpError(404, 'Member not found.');
+-  if (actor.id === target.id || target.role === 'owner' || rank(target.role) >= rank(actor.role)) {
++  // Someone holding only the permission moderates like staff: members, never peers or higher roles.
++  const actorRank = Math.max(rank(actor.role), 2);
++  if (actor.id === target.id || target.role === DEVELOPER || rank(target.role) >= actorRank) {
+     throw new HttpError(403, 'You can only timeout members below your role.');
+   }
+ }
+ export function requireProfileEdit(actor, target, nextRole) {
+-  requireRole(actor, 'admin');
++  requirePermission(actor, 'roster.manage');
+   if (!target || target.deleted) throw new HttpError(404, 'Member not found.');
+   if (nextRole !== target.role) {
+-    requireOwner(actor);
++    requireDeveloper(actor);
+     if (!ROLES.includes(nextRole)) throw new HttpError(400, 'Choose a valid role.');
+   }
+ }
++export function cleanPermissions(value) {
++  if (!Array.isArray(value)) throw new HttpError(400, 'Choose valid permissions.');
++  const list = [...new Set(value)];
++  if (list.some(k => !PERMISSION_KEYS.includes(k))) throw new HttpError(400, 'Choose valid permissions.');
++  return PERMISSION_KEYS.filter(k => list.includes(k));
++}
++export function cleanRosterTitle(value) {
++  const title = value ?? '';
++  if (title !== '' && !ROSTER_TITLES.includes(title)) throw new HttpError(400, 'Choose a valid roster title.');
++  return title;
++}
++// Public cards never include the system role, explicit permissions, Discord details or auth fields.
+ export const publicProfile = p => ({
+-  id: p.id, username: p.username, role: p.role, divisions: p.divisions,
++  id: p.id, username: p.username, rosterTitle: p.rosterTitle || '', divisions: p.divisions,
+   displayName: p.displayName, title: p.title, bio: p.bio, avatarUrl: p.avatarUrl, createdAt: p.createdAt,
+ });
++// What a signed-in user may see about their own account.
++export const selfProfile = p => ({
++  id: p.id, username: p.username, role: p.role, rosterTitle: p.rosterTitle || '', divisions: p.divisions,
++  displayName: p.displayName, title: p.title, bio: p.bio, avatarUrl: p.avatarUrl, createdAt: p.createdAt,
++  timeoutUntil: p.timeoutUntil, permissions: p.permissions || [], can: effectivePermissions(p),
++  discordUsername: p.discordId ? p.discordUsername : '', discordLinked: !!p.discordId,
++});
++// What managers see in the admin list. Explicit permissions and Discord links are for developers only.
++export const managerProfile = (p, viewer) => ({
++  ...publicProfile(p), role: p.role,
++  ...(isDeveloper(viewer) ? { permissions: p.permissions || [], discordUsername: p.discordId ? p.discordUsername : '' } : {}),
++});
+diff --git a/public/app.js b/public/app.js
+index 2134d5e..0e1f7aa 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -1,10 +1,20 @@
+ const C = window.YVO;
+ const sb = window.supabase?.createClient(C.SUPABASE_URL, C.SUPABASE_ANON_KEY);
+ const DIVS = ['cch', 'fs', 'vfx', 'gfx', 'staff'];
+-const ROLES = ['member', 'staff', 'admin', 'co-owner', 'owner'];
+-const GROUPS = ['owner', 'co-owner', 'admin', ...DIVS];
+-const rank = role => ({ member: 1, staff: 2, admin: 3, 'co-owner': 4, owner: 5 })[role] || 0;
+-const label = value => ({ owner: 'Owner', 'co-owner': 'Co-Owner', admin: 'Admin', staff: 'Staff', member: 'Member' })[value] || String(value).toUpperCase();
++// System roles control access. Roster titles and groups are display-only and never grant anything.
++const ROLES = ['member', 'staff', 'admin', 'website-developer'];
++const ROSTER_TITLES = ['owner', 'co-owner', 'website-developer', 'admin', 'staff'];
++const TITLE_GROUP = { owner: 'leadership', 'co-owner': 'leadership', 'website-developer': 'leadership', admin: 'administration', staff: 'staff' };
++const GROUPS = ['leadership', 'administration', 'staff', 'cch', 'fs', 'vfx', 'gfx'];
++const LEGACY_GROUPS = { owner: 'leadership', 'co-owner': 'leadership', admin: 'administration' };
++const PERMS = { 'chat.moderate': 'Moderate chat (delete messages, timeouts)', 'divisions.all': 'Access every division channel and vault', 'roster.manage': 'Manage member cards and roster entries', 'announcements.manage': 'Post and remove announcements', 'vault.manage': 'Manage team vault resources', 'tiktok.manage': 'Pin and remove TikTok videos' };
++const rank = role => ({ member: 1, staff: 2, admin: 3, 'website-developer': 4 })[role] || 0;
++const label = value => ({ 'website-developer': 'Website Developer', 'co-owner': 'Co-Owner', leadership: 'Leadership', administration: 'Administration', owner: 'Owner', admin: 'Admin', staff: 'Staff', member: 'Member' })[value] || String(value).toUpperCase();
++const DISCORD_INVITE = 'https://discord.gg/NtSChwqRGJ';
++const has = permission => !!me?.can?.includes(permission);
++const isDev = () => me?.role === 'website-developer';
++const canManage = () => ['roster.manage', 'announcements.manage', 'vault.manage', 'tiktok.manage'].some(has);
++const discordLink = (cls = 'ghost') => `<a class="${cls} discord-link" href="${DISCORD_INVITE}" target="_blank" rel="noopener noreferrer">Join Our Discord <span aria-hidden="true">↗</span></a>`;
+ const $ = selector => document.querySelector(selector);
+ const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+ const safe = value => /^https?:\/\//i.test(value || '') ? esc(value) : '#';
+@@ -17,6 +27,9 @@ const empty = (title, description = '') => `<div class="empty"><div class="empty
+ const pageHead = (eyebrow, title, description = '', action = '') => `<div class="page-head"><div><div class="eyebrow">${esc(eyebrow)}</div><h1>${esc(title)}</h1>${description ? `<p>${esc(description)}</p>` : ''}</div>${action}</div>`;
+ const checkboxes = (selected = []) => `<fieldset><legend>Divisions</legend>${DIVS.map(d => `<label class="lbl"><input type="checkbox" name="division" value="${d}" ${selected.includes(d) ? 'checked' : ''}>${label(d)}</label>`).join('')}</fieldset>`;
+ const options = (values, selected) => values.map(v => `<option value="${v}" ${v === selected ? 'selected' : ''}>${label(v)}</option>`).join('');
++const permissionBoxes = (selected = []) => `<fieldset><legend>Custom permissions</legend>${Object.entries(PERMS).map(([k, d]) => `<label class="lbl"><input type="checkbox" name="perm" value="${k}" ${selected.includes(k) ? 'checked' : ''}>${esc(d)}</label>`).join('')}</fieldset><p class="muted small">Permissions are granted individually. A roster title never grants any.</p>`;
++const titleOptions = (selected = '', group = null) => `<option value="">No roster title</option>${ROSTER_TITLES.filter(v => !group || TITLE_GROUP[v] === group).map(v => `<option value="${v}" ${v === selected ? 'selected' : ''}>${label(v)}</option>`).join('')}`;
++const selectedPermissions = form => [...form.querySelectorAll('[name=perm]:checked')].map(el => el.value);
+ const selectedDivisions = form => [...form.querySelectorAll('[name=division]:checked')].map(el => el.value);
+ const formData = form => Object.fromEntries(new FormData(form));
+ function notify(message) {
+@@ -41,7 +54,8 @@ function renderNav() {
+   $('#nav').innerHTML = `<a class="logo" href="#/" aria-label="Team YVO home"><img src="/assets/yvo-mark.png" alt=""><span>TEAM <b>YVO</b></span></a>
+     <a href="#/" ${!page ? 'class="active" aria-current="page"' : ''}>Home</a>
+     <a href="#/roster" ${page === 'roster' ? 'class="active" aria-current="page"' : ''}>Roster</a>
+-    ${me ? `<a href="#/hub" ${page === 'hub' ? 'class="active" aria-current="page"' : ''}>Hub</a>${rank(me.role) >= 3 ? `<a href="#/admin" ${page === 'admin' ? 'class="active" aria-current="page"' : ''}>Manage</a>` : ''}` : ''}
++    ${me ? `<a href="#/hub" ${page === 'hub' ? 'class="active" aria-current="page"' : ''}>Hub</a>${canManage() ? `<a href="#/admin" ${page === 'admin' ? 'class="active" aria-current="page"' : ''}>Manage</a>` : ''}` : ''}
++    <a class="nav-discord" href="${DISCORD_INVITE}" target="_blank" rel="noopener noreferrer">Discord ↗</a>
+     <span class="nav-divider" aria-hidden="true"></span>${me ? `<button class="ghost small" id="logout">Log out</button>` : '<a class="btn" href="#/login">Team login <span aria-hidden="true">↗</span></a>'}`;
+   if ($('#logout')) $('#logout').onclick = async () => {
+     try {
+@@ -74,7 +88,7 @@ function postTiles(posts) {
+ async function home() {
+   $('#app').innerHTML = `<section class="hero"><div class="hero-copy"><div class="eyebrow">Rocket League. Creative culture.</div>
+     <h1>BUILT FOR<br>THE <em>GAME.</em><br>MADE TO<br>BE SEEN.</h1><p>${esc(C.STORY[0])} From the first touch to the final frame. This is Team YVO.</p>
+-    <div class="hero-actions"><a class="btn" href="#/roster">Meet the roster <span aria-hidden="true">↗</span></a><a class="ghost" href="https://www.tiktok.com/@teamyvo" target="_blank" rel="noopener noreferrer">Watch the clips <span aria-hidden="true">▷</span></a></div></div>
++    <div class="hero-actions"><a class="btn" href="#/roster">Meet the roster <span aria-hidden="true">↗</span></a><a class="ghost" href="https://www.tiktok.com/@teamyvo" target="_blank" rel="noopener noreferrer">Watch the clips <span aria-hidden="true">▷</span></a>${discordLink()}</div></div>
+     <div class="hero-visual" aria-label="Team YVO Rocket League arena graphic"><span class="visual-corner top">YVO // EST. TO CREATE</span><div class="speed-lines"></div><div class="orbital"></div>
+     <svg class="arena" viewBox="0 0 400 220" fill="none" aria-hidden="true"><path d="M60 35H340L390 190H10L60 35Z M200 35V190 M36 110H364 M85 35L65 82H125L135 35 M265 35L275 82H335L315 35" stroke="currentColor"/><ellipse cx="200" cy="110" rx="53" ry="27" stroke="currentColor"/><path d="M160 35V17H240V35M145 190V210H255V190" stroke="currentColor"/></svg>
+     <img class="hero-mark" src="/assets/yvo-mark.png" alt="Team YVO logo" fetchpriority="high"><span class="visual-corner bottom">ALL BOOST. NO BRAKES. ↗</span></div></section>
+@@ -86,8 +100,8 @@ async function home() {
+ }
+ function personCard(person, type = 'profile') {
+   const profile = type === 'profile', name = person.displayName || person.username;
+-  return `<article class="card person">${rank(me?.role) >= 3 ? `<button class="ghost small edit-card" data-edit="${profile ? 'profile' : 'roster'}" data-id="${esc(person.id)}" aria-label="Edit ${esc(name)}">Edit ↗</button>` : ''}
+-    ${avatar(person, name)}<div class="role-label">${label(profile ? person.role : person.division)}</div><h3>${esc(name)}</h3>
++  return `<article class="card person">${has('roster.manage') ? `<button class="ghost small edit-card" data-edit="${profile ? 'profile' : 'roster'}" data-id="${esc(person.id)}" aria-label="Edit ${esc(name)}">Edit ↗</button>` : ''}
++    ${avatar(person, name)}<div class="role-label">${label(person.rosterTitle || (profile ? 'member' : person.division))}</div><h3>${esc(name)}</h3>
+     ${profile ? `<div class="muted small">@${esc(person.username)}</div>` : ''}${person.title ? `<div class="muted small">${esc(person.title)}</div>` : ''}
+     ${profile ? `<div class="badges">${person.divisions.map(d => `<span class="badge">${label(d)}</span>`).join('')}</div>` : ''}${person.bio ? `<p class="bio">${esc(person.bio)}</p>` : ''}</article>`;
+ }
+@@ -96,16 +110,17 @@ async function roster(arg) {
+   $('#app').innerHTML = pageHead('The people behind YVO', 'The roster.', 'On the field. Behind the edit. Part of the same team.') + '<div class="skeleton"></div>';
+   const data = await request('public'); if (generation !== routeId) return;
+   publicMembers = data.members;
+-  let tab = GROUPS.includes(arg) ? arg : 'cch';
+-  const membersFor = group => data.members.filter(m => ['owner', 'co-owner', 'admin'].includes(group) ? m.role === group : m.divisions.includes(group));
++  let tab = GROUPS.includes(arg) ? arg : LEGACY_GROUPS[arg] || 'leadership';
++  // Groups come from roster titles and divisions only; system roles and permissions are never consulted.
++  const membersFor = group => data.members.filter(m => TITLE_GROUP[m.rosterTitle] === group || (DIVS.includes(group) && m.divisions.includes(group)));
+   const draw = () => {
+     const members = membersFor(tab), entries = data.roster.filter(r => r.division === tab);
+-    $('#app').innerHTML = pageHead('The people behind YVO', 'The roster.', 'On the field. Behind the edit. Part of the same team.', rank(me?.role) >= 3 ? '<button class="ghost" id="add-roster">Add to roster ↗</button>' : '') +
++    $('#app').innerHTML = pageHead('The people behind YVO', 'The roster.', 'On the field. Behind the edit. Part of the same team.', has('roster.manage') ? '<button class="ghost" id="add-roster">Add to roster ↗</button>' : '') +
+       `<div class="tabs" aria-label="Roster groups">${GROUPS.map(g => `<button class="pill ${tab === g ? 'on' : ''}" data-group="${g}" aria-pressed="${tab === g}">${label(g)}<span class="count">${membersFor(g).length + data.roster.filter(r => r.division === g).length}</span></button>`).join('')}</div>
+       ${members.length + entries.length ? `<div class="grid">${members.map(m => personCard(m)).join('')}${entries.map(r => personCard(r, 'roster')).join('')}</div>` : empty('Room for the next name.', `The ${label(tab)} roster is getting ready. Check back for the lineup.`)}`;
+     document.querySelectorAll('[data-group]').forEach(b => b.onclick = () => { tab = b.dataset.group; history.replaceState(null, '', '#/roster/' + tab); draw(); });
+     $('#add-roster')?.addEventListener('click', () => editRoster({ division: tab }, () => roster(tab)));
+-    document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => b.dataset.edit === 'profile' ? editProfile(data.members.find(m => m.id === b.dataset.id), () => roster(tab)) : editRoster(data.roster.find(r => r.id === b.dataset.id), () => roster(tab)));
++    document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => b.dataset.edit === 'profile' ? editMember(b.dataset.id, () => roster(tab)) : editRoster(data.roster.find(r => r.id === b.dataset.id), () => roster(tab)));
+   }; draw();
+ }
+ function modal(title, content, onSubmit) {
+@@ -120,26 +135,47 @@ function modal(title, content, onSubmit) {
+   };
+   dialog.showModal();
+ }
++async function editMember(id, done) {
++  try { const { members } = await api('adminData'); editProfile(members.find(m => m.id === id), done); }
++  catch (error) { notify(error.message); }
++}
+ function editProfile(person, done) {
++  if (!person) return notify('Member not found.');
++  const dev = isDev();
+   modal('Edit ' + person.username, `<div class="stack"><label>Display name<input name="displayName" maxlength="50" value="${esc(person.displayName || person.username)}" required></label>
+     <label>Card title<input name="title" maxlength="80" value="${esc(person.title)}" placeholder="Player, editor, designer…"></label><label>Bio<textarea name="bio" maxlength="500">${esc(person.bio)}</textarea></label>
+     <label>Avatar URL<input name="avatarUrl" type="url" value="${esc(person.avatarUrl)}" placeholder="https://…"></label>
+-    <label>Website role<select name="role" ${me.role !== 'owner' ? 'disabled' : ''}>${options(ROLES, person.role)}</select></label></div>${checkboxes(person.divisions)}<p class="muted small">Uncheck a division to remove it from this card and its chat access. Only owners can change website roles.</p>`, async form => {
+-    await api('updateProfile', { ...formData(form), id: person.id, role: me.role === 'owner' ? form.elements.namedItem('role').value : person.role, divisions: selectedDivisions(form) });
++    <label>Website role (controls access)<select name="role" ${dev ? '' : 'disabled'}>${options(ROLES, person.role)}</select></label>
++    ${dev ? `<label>Roster title (display only)<select name="rosterTitle">${titleOptions(person.rosterTitle)}</select></label>` : ''}</div>${checkboxes(person.divisions)}${dev ? permissionBoxes(person.permissions || []) : ''}<p class="muted small">Uncheck a division to remove it from this card and its chat access. Only Website Developers can change website roles, roster titles and permissions.</p>`, async form => {
++    const payload = { ...formData(form), id: person.id, role: dev ? form.elements.namedItem('role').value : person.role, divisions: selectedDivisions(form) };
++    if (dev) { payload.rosterTitle = form.elements.namedItem('rosterTitle').value; payload.permissions = selectedPermissions(form); } else { delete payload.rosterTitle; }
++    await api('updateProfile', payload);
+     await loadMe(); await done(); notify('Card updated.');
+   });
+ }
+ function editRoster(entry = {}, done) {
+   modal(entry.id ? 'Edit roster entry' : 'Add to roster', `<div class="stack"><label>Display name<input name="displayName" maxlength="50" value="${esc(entry.displayName)}" required></label>
+     <label>Title<input name="title" maxlength="80" value="${esc(entry.title)}" placeholder="Player, editor, designer…"></label>
+-    <label>Roster group<select name="division">${options(GROUPS, entry.division || 'cch')}</select></label>
++    <label>Roster group<select name="division">${options(GROUPS, entry.division || 'leadership')}</select></label>
++    <label>Roster title (display only)<select name="rosterTitle">${titleOptions(entry.rosterTitle, entry.division || 'leadership')}</select></label>
+     <label>Avatar URL<input name="avatarUrl" type="url" value="${esc(entry.avatarUrl)}" placeholder="https://…"></label><label>Display order<input name="sort" type="number" min="-9999" max="9999" value="${Number(entry.sort) || 0}"></label></div>`, async form => {
+     await api(entry.id ? 'updateRoster' : 'addRoster', { ...formData(form), id: entry.id }); await done(); notify('Roster saved.');
+   });
++  const group = $('#modal [name=division]'), title = $('#modal [name=rosterTitle]');
++  group.onchange = () => { title.innerHTML = titleOptions('', group.value); };
++}
++async function signIn(auth, email, password) {
++  try { await auth.login(email, password); authMode = 'identity'; }
++  catch {
++    if (!sb) throw new Error('Login is unavailable. Please refresh and try again.');
++    const { error } = await sb.auth.signInWithPassword({ email, password });
++    if (error) throw new Error('Wrong username or password.');
++    authMode = 'legacy';
++  }
+ }
+ function login(activate = false) {
+   if (me) { location.hash = '#/hub'; return; }
+-  $('#app').innerHTML = `<section class="login"><div class="eyebrow">Your team. Your space.</div><h1>${activate ? 'Join the lineup.' : 'Welcome back.'}</h1><p>${activate ? 'Use the activation token shared by an owner to create your account.' : 'Log in to the team hub, chat, and your player card.'}</p>
++  $('#app').innerHTML = `<section class="login"><div class="eyebrow">Your team. Your space.</div><h1>${activate ? 'Join the lineup.' : 'Welcome back.'}</h1><p>${activate ? 'Use the activation token from a Website Developer to create your account or regain access to it.' : 'Log in to the team hub, chat, and your player card.'}</p>
+     <div class="card"><form id="login-form" class="stack">${activate ? '<label>Activation token<input name="token" placeholder="YVO-…" autocomplete="off" maxlength="100" required></label>' : '<label>Username<input name="username" placeholder="Your username" autocomplete="username" required></label>'}
+     <label>${activate ? 'Choose a password' : 'Password'}<input name="password" type="password" autocomplete="${activate ? 'new-password' : 'current-password'}" minlength="8" ${activate ? 'placeholder="At least 8 characters"' : ''} required></label>
+     ${activate ? '<label>Repeat password<input name="repeat" type="password" autocomplete="new-password" minlength="8" required></label>' : ''}<p class="err" id="login-error" role="alert"></p><button class="btn">${activate ? 'Activate account' : 'Enter the hub'} <span aria-hidden="true">↗</span></button></form></div>
+@@ -152,21 +188,18 @@ function login(activate = false) {
+       if (activate) {
+         if (values.password !== values.repeat) throw new Error('Passwords do not match.');
+         const invite = await request('prepare-claim', { token: values.token });
+-        const user = await auth.signup(invite.username + '@members.yvo.team', values.password, { activation_token: values.token });
+-        if (!user.emailVerified) throw new Error('Activation is still completing. Try logging in in a moment.');
+-        authMode = 'identity';
+-      } else {
+-        const email = values.username.trim().toLowerCase() + '@members.yvo.team';
+-        try { await auth.login(email, values.password); authMode = 'identity'; }
+-        catch {
+-          if (!sb) throw new Error('Login is unavailable. Please refresh and try again.');
+-          const { error } = await sb.auth.signInWithPassword({ email, password: values.password });
+-          if (error) throw new Error('Wrong username or password.');
+-          authMode = 'legacy';
++        if (invite.mode === 'recover') {
++          // Existing account: same username, roster entry and data. Only the password changes.
++          await request('complete-recovery', { token: values.token, password: values.password });
++          await signIn(auth, invite.username + '@members.yvo.team', values.password);
++        } else {
++          const user = await auth.signup(invite.username + '@members.yvo.team', values.password, { activation_token: values.token });
++          if (!user.emailVerified) throw new Error('Activation is still completing. Try logging in in a moment.');
++          authMode = 'identity';
+         }
+-      }
++      } else await signIn(auth, values.username.trim().toLowerCase() + '@members.yvo.team', values.password);
+       localStorage.setItem('yvo-auth-provider', authMode);
+-      await loadMe(); if (!me) throw new Error('This account does not have website access. Contact an owner.');
++      await loadMe(); if (!me) throw new Error('This account does not have website access. Contact a Website Developer.');
+       location.hash = '#/hub';
+     } catch (error) { $('#login-error').textContent = error.message || 'Could not log in. Please try again.'; }
+     finally { if (button.isConnected) button.disabled = false; }
+@@ -178,21 +211,68 @@ async function hub() {
+   const data = await api('hubData'); if (generation !== routeId) return;
+   me = data.me;
+   $('#app').innerHTML = pageHead('Team members only', 'The team hub.', 'Keep the conversation going. Share the next great play.') + data.announcements.map(a => `<div class="ann">${esc(a.body)}</div>`).join('') +
+-    `<div class="tabs"><button class="pill on" data-pane="chat">Team chat</button><button class="pill" data-pane="vault">Vault</button><button class="pill" data-pane="card">My card</button>${rank(me.role) >= 2 ? '<button class="pill" data-pane="moderation">Moderation</button>' : ''}</div><div id="pane"></div>`;
++    `<div class="tabs"><button class="pill on" data-pane="chat">Team chat</button><button class="pill" data-pane="vault">Vault</button><button class="pill" data-pane="card">My card</button><button class="pill" data-pane="settings">Settings</button>${has('chat.moderate') ? '<button class="pill" data-pane="moderation">Moderation</button>' : ''}</div><div id="pane"></div>`;
+   const show = pane => {
+     cleanPane(); cleanPane = () => {};
+     document.querySelectorAll('[data-pane]').forEach(b => b.classList.toggle('on', b.dataset.pane === pane));
+     if (pane === 'vault') $('#pane').innerHTML = data.resources.length ? `<div class="grid">${data.resources.map(r => `<a class="card" href="${safe(r.url)}" target="_blank" rel="noopener noreferrer"><span class="eyebrow">${r.division ? label(r.division) : 'Team resource'}</span><h3>${esc(r.title)} ↗</h3><span class="muted small">Open resource</span></a>`).join('')}</div>` : empty('The vault is quiet.', 'Shared team links appear here when an admin adds them.');
+     else if (pane === 'card') {
+-      $('#pane').innerHTML = `<div class="member-profile">${personCard(me)}<p class="muted small">Joined ${new Date(me.createdAt).toLocaleDateString()}. Contact an admin or owner to update your card.</p></div>`;
++      $('#pane').innerHTML = `<div class="member-profile">${personCard(me)}<p class="muted small">Joined ${new Date(me.createdAt).toLocaleDateString()}. Contact an admin or Website Developer to update your card.</p></div>`;
+       $('[data-edit]')?.addEventListener('click', () => editProfile(me, () => show('card')));
+-    } else if (pane === 'moderation') renderModeration();
++    } else if (pane === 'settings') renderSettings();
++    else if (pane === 'moderation') renderModeration();
+     else showChat('general');
+   };
+   document.querySelectorAll('[data-pane]').forEach(b => b.onclick = () => show(b.dataset.pane));
+-  show('chat');
++  const firstPane = sessionStorage.getItem('yvo-hub-pane'); sessionStorage.removeItem('yvo-hub-pane');
++  show(firstPane === 'settings' ? 'settings' : 'chat');
++}
++const canTimeout = target => has('chat.moderate') && target && target.id !== me.id && target.role !== 'website-developer' && rank(target.role) < Math.max(rank(me.role), 2);
++const DISCORD_MESSAGES = { linked: 'Discord connected.', denied: 'Discord linking was cancelled.', duplicate: 'That Discord account is already linked to another member.', 'already-linked': 'Disconnect your current Discord account first.', invalid: 'That Discord request expired. Please try again.', error: 'Could not connect Discord. Please try again.' };
++function renderSettings() {
++  $('#pane').innerHTML = `<div class="settings-grid"><section class="card"><h2>Change password</h2><p class="muted small">Enter your current password to set a new one.</p>
++    <form id="password-form" class="stack"><label>Current password<input name="current" type="password" autocomplete="current-password" required></label>
++    <label>New password<input name="next" type="password" autocomplete="new-password" minlength="8" maxlength="128" required></label>
++    <label>Repeat new password<input name="repeat" type="password" autocomplete="new-password" minlength="8" maxlength="128" required></label>
++    <p class="err" id="password-error" role="alert"></p><button class="btn">Update password</button></form></section>
++    <section class="card"><h2>Discord</h2>${me.discordLinked ? `<p>Connected as <b>${esc(me.discordUsername)}</b></p><p class="muted small">Only your Discord username is shared with the website.</p><button class="danger" id="discord-disconnect">Disconnect Discord</button>`
++      : `<p class="muted small">Link your Discord account to your Team YVO profile. We only ask to read your Discord username.</p><button class="btn" id="discord-connect">Connect Discord ↗</button>`}
++    <p class="err" id="discord-error" role="alert"></p><div style="margin-top:18px">${discordLink()}</div></section></div>`;
++  $('#password-form').onsubmit = async e => {
++    e.preventDefault(); const form = e.target, v = formData(form), button = form.querySelector('button'), error = $('#password-error'); error.textContent = '';
++    if (v.next !== v.repeat) { error.textContent = 'New passwords do not match.'; return; }
++    if (v.next.length < 8 || v.next.length > 128) { error.textContent = 'Use a password of 8 to 128 characters.'; return; }
++    if (v.next === v.current) { error.textContent = 'Choose a password different from your current one.'; return; }
++    button.disabled = true;
++    try {
++      const email = me.username + '@members.yvo.team';
++      if (authMode === 'legacy') {
++        if (!sb) throw new Error('Password changes are unavailable. Please refresh.');
++        const check = await sb.auth.signInWithPassword({ email, password: v.current });
++        if (check.error) throw new Error('Your current password is wrong.');
++        const { error: failure } = await sb.auth.updateUser({ password: v.next });
++        if (failure) throw new Error('Could not update your password. Try a stronger one.');
++      } else {
++        const auth = await identity();
++        try { await auth.login(email, v.current); } catch { throw new Error('Your current password is wrong.'); }
++        try { await auth.updateUser({ password: v.next }); } catch { throw new Error('Could not update your password. Try a stronger one.'); }
++      }
++      form.reset(); notify('Password updated.');
++    } catch (failure) { error.textContent = failure.message; }
++    finally { button.disabled = false; }
++  };
++  $('#discord-connect')?.addEventListener('click', async e => {
++    e.target.disabled = true;
++    try { const { url } = await api('discordStart'); location.href = url; }
++    catch (failure) { $('#discord-error').textContent = failure.message; e.target.disabled = false; }
++  });
++  $('#discord-disconnect')?.addEventListener('click', async e => {
++    if (!confirm('Disconnect your Discord account?')) return;
++    e.target.disabled = true;
++    try { await api('discordDisconnect'); await loadMe(); renderSettings(); notify('Discord disconnected.'); }
++    catch (failure) { $('#discord-error').textContent = failure.message; e.target.disabled = false; }
++  });
+ }
+-const canTimeout = target => rank(me?.role) >= 2 && target && target.id !== me.id && target.role !== 'owner' && rank(target.role) < rank(me.role);
+ function timeoutDialog(person, done) {
+   modal('Timeout ' + person.username, `<p class="muted small">A timeout stops this member from sending messages in every chat. They can still read the conversations.</p><label>Duration<select name="minutes"><option value="10">10 minutes</option><option value="5">5 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="1440">24 hours</option><option value="10080">7 days</option><option value="0">Remove timeout</option></select></label>`, async form => {
+     await api('timeoutMember', { id: person.id, minutes: Number(form.elements.namedItem('minutes').value) }); await done(); notify('Chat permissions updated.');
+@@ -202,7 +282,7 @@ async function renderModeration() {
+   try {
+     const { moderationMembers = [] } = await api('hubData');
+     if (!$('#pane')) return;
+-    $('#pane').innerHTML = `<div class="card"><h2>Chat moderation</h2><p class="muted small">Timeouts apply across all channels. Staff can moderate members below their own website role.</p>${moderationMembers.length ? moderationMembers.map(p => `<div class="li"><div><b>${esc(p.username)}</b><small>${label(p.role)}${p.timeoutUntil && new Date(p.timeoutUntil) > new Date() ? ` · Timed out until ${esc(new Date(p.timeoutUntil).toLocaleString())}` : ' · Can chat'}</small></div>${canTimeout(p) ? `<button class="ghost small" data-timeout="${esc(p.id)}">Manage timeout</button>` : ''}</div>`).join('') : '<p class="muted">No team members yet.</p>'}</div>`;
++    $('#pane').innerHTML = `<div class="card"><h2>Chat moderation</h2><p class="muted small">Timeouts apply across all channels. Moderators can timeout members below their own website role.</p>${moderationMembers.length ? moderationMembers.map(p => `<div class="li"><div><b>${esc(p.username)}</b><small>${label(p.role)}${p.timeoutUntil && new Date(p.timeoutUntil) > new Date() ? ` · Timed out until ${esc(new Date(p.timeoutUntil).toLocaleString())}` : ' · Can chat'}</small></div>${canTimeout(p) ? `<button class="ghost small" data-timeout="${esc(p.id)}">Manage timeout</button>` : ''}</div>`).join('') : '<p class="muted">No team members yet.</p>'}</div>`;
+     document.querySelectorAll('[data-timeout]').forEach(b => b.onclick = () => timeoutDialog(moderationMembers.find(p => p.id === b.dataset.timeout), renderModeration));
+   } catch (error) { notify(error.message); }
+ }
+@@ -210,12 +290,12 @@ async function showChat(channel) {
+   cleanPane();
+   let alive = true, timer, busy = false, lastMessages = '', knownMembers = [];
+   cleanPane = () => { alive = false; clearTimeout(timer); };
+-  const channels = ['general', 'tiktok', ...(rank(me.role) >= 2 ? DIVS : me.divisions)];
++  const channels = ['general', 'tiktok', ...(has('divisions.all') ? DIVS : me.divisions)];
+   $('#pane').innerHTML = `<div class="hub-layout"><aside class="channels" aria-label="Chat channels"><div class="eyebrow">Team channels</div>${channels.map(c => `<button class="pill ${c === channel ? 'on' : ''}" data-channel="${c}"># ${c}</button>`).join('')}</aside><section class="card chat-card"><div class="chat-heading"><h3># ${channel}</h3><span>${channel === 'tiktok' ? 'Team YVO / live TikTok feed' : 'The conversation starts here'}</span></div>
+     ${channel === 'tiktok' ? `<div style="padding:20px">${tiktokFeed()}</div>` : ''}<div id="chat" role="log" aria-label="Chat messages"><div class="loading-state">Loading messages…</div></div><div class="composer"><form id="chat-form" class="row"><label class="sr-only" for="chat-input">Message #${channel}</label><input id="chat-input" placeholder="Message #${channel}" maxlength="2000" autocomplete="off" required><button class="btn">Send ↗</button></form><p class="err" id="chat-error" role="alert"></p><p class="muted small" id="timeout-notice" role="status"></p></div></section></div>`;
+   if (channel === 'tiktok') mountTikTok();
+   document.querySelectorAll('[data-channel]').forEach(b => b.onclick = () => showChat(b.dataset.channel));
+-  if (rank(me.role) >= 2) { try { knownMembers = (await request('public')).members; } catch { /* Message removal remains available. */ } if (!alive) return; }
++  if (has('chat.moderate')) { try { knownMembers = (await api('hubData')).moderationMembers; } catch { /* Message removal remains available. */ } if (!alive) return; }
+   async function refresh() {
+     if (!alive || busy) return;
+     busy = true;
+@@ -228,7 +308,7 @@ async function showChat(channel) {
+         lastMessages = signature;
+         box.innerHTML = messages.length ? messages.map(m => {
+           const person = knownMembers.find(p => p.id === m.userId);
+-          return `<article class="msg"><div class="msg-meta"><b>${esc(m.username)}</b><time datetime="${esc(m.createdAt)}" title="${esc(new Date(m.createdAt).toLocaleString())}">${esc(new Date(m.createdAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }))}</time>${rank(me.role) >= 2 ? `<div class="msg-actions"><button type="button" data-delete-message="${esc(m.id)}" aria-label="Remove message by ${esc(m.username)}">Remove</button>${canTimeout(person) ? `<button type="button" data-timeout="${esc(person.id)}">Timeout</button>` : ''}</div>` : ''}</div><div class="msg-body">${esc(m.body)}</div></article>`;
++          return `<article class="msg"><div class="msg-meta"><b>${esc(m.username)}</b><time datetime="${esc(m.createdAt)}" title="${esc(new Date(m.createdAt).toLocaleString())}">${esc(new Date(m.createdAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }))}</time>${has('chat.moderate') ? `<div class="msg-actions"><button type="button" data-delete-message="${esc(m.id)}" aria-label="Remove message by ${esc(m.username)}">Remove</button>${canTimeout(person) ? `<button type="button" data-timeout="${esc(person.id)}">Timeout</button>` : ''}</div>` : ''}</div><div class="msg-body">${esc(m.body)}</div></article>`;
+         }).join('') : '<div class="loading-state">No messages yet. Make the first touch.</div>';
+         if (nearBottom) box.scrollTop = box.scrollHeight;
+         box.querySelectorAll('[data-delete-message]').forEach(b => b.onclick = async () => {
+@@ -255,31 +335,38 @@ async function showChat(channel) {
+   await poll();
+ }
+ async function admin(newToken = null) {
+-  if (rank(me?.role) < 3) { location.hash = '#/'; return; }
++  if (!canManage()) { location.hash = '#/'; return; }
+   const generation = routeId, data = await api('adminData'); if (generation !== routeId) return;
+   currentAdmin = data;
+   const li = (items, render, action) => items.map(item => `<div class="li"><div>${render(item)}</div><div class="actions"><button class="danger small" data-delete="${action}" data-id="${esc(item.id)}">Remove</button></div></div>`).join('');
+   $('#app').innerHTML = pageHead('Behind the scenes', 'Team management.', 'Keep the lineup, cards, and team space up to date.') + `<p id="admin-error" class="err" role="alert"></p><div class="admin-grid">
+-    ${me.role === 'owner' ? `<section class="card"><h2>Invite a teammate</h2><p class="muted small">Only owners can generate activation tokens. Tokens expire after 7 days.</p><form data-action="createInvite"><div class="f"><label>Username<input name="username" pattern="[a-z0-9_]{3,20}" placeholder="username" minlength="3" maxlength="20" required></label><label>Website role<select name="role">${options(ROLES, 'member')}</select></label><button class="btn">Generate token ↗</button></div>${checkboxes()}</form>
+-      ${newToken ? `<div class="tok"><p class="small">Activation token for <b>${esc(newToken.username)}</b>. Copy it now; it is shown only once.</p><code id="new-token">${esc(newToken.token)}</code><div class="row"><button class="ghost small" id="copy-token">Copy token</button><button class="ghost small" id="dismiss-token">Dismiss</button></div></div>` : ''}
+-      <h3 style="margin-top:26px">Pending invitations</h3>${data.invites.length ? li(data.invites, i => `<b>${esc(i.username)}</b><small>${label(i.role)} · Expires ${new Date(i.expiresAt).toLocaleDateString()}</small>`, 'deleteInvite') : '<p class="muted small">No pending invitations.</p>'}</section>` : ''}
+-    <section class="card"><h2>Member cards</h2><p class="muted small">Edit a card to update its display name, bio, image, or division roles. Owners can also manage website roles and remove accounts.</p>
+-    ${data.members.map(p => `<div class="li"><div><b>${esc(p.displayName || p.username)}</b><small>@${esc(p.username)} · ${label(p.role)} · ${p.divisions.map(label).join(', ') || 'No divisions'}</small></div><div class="actions"><button class="ghost small" data-profile="${esc(p.id)}">Edit card</button>${me.role === 'owner' && p.id !== me.id ? `<button class="danger small" data-delete="deleteMember" data-id="${esc(p.id)}">Remove account</button>` : ''}</div></div>`).join('')}</section>
++    ${isDev() ? `<section class="card"><h2>Invite a teammate</h2><p class="muted small">Only Website Developers can generate activation tokens and assign permissions. Tokens are single-use and expire after 7 days.</p><form data-action="createInvite"><div class="f"><label>Username<input name="username" pattern="[a-z0-9_]{3,20}" placeholder="username" minlength="3" maxlength="20" required></label><label>Website role<select name="role">${options(ROLES, 'member')}</select></label><label>Roster title (display only)<select name="rosterTitle">${titleOptions()}</select></label><button class="btn">Generate token ↗</button></div>${checkboxes()}${permissionBoxes()}</form>
++      ${newToken ? `<div class="tok"><p class="small">${newToken.reset ? 'Recovery token' : 'Activation token'} for <b>${esc(newToken.username)}</b>${newToken.reset ? `. It works once and expires ${esc(new Date(newToken.expiresAt).toLocaleString())}. Any earlier token for this account no longer works` : ''}. Copy it now; it is shown only once.</p><code id="new-token">${esc(newToken.token)}</code><div class="row"><button class="ghost small" id="copy-token">Copy token</button><button class="ghost small" id="dismiss-token">Dismiss</button></div></div>` : ''}
++      <h3 style="margin-top:26px">Pending invitations</h3>${data.invites.length ? li(data.invites, i => `<b>${esc(i.username)}</b><small>${label(i.role)}${i.permissions?.length ? ` · ${i.permissions.length} custom permission${i.permissions.length > 1 ? 's' : ''}` : ''} · Expires ${new Date(i.expiresAt).toLocaleDateString()}</small>`, 'deleteInvite') : '<p class="muted small">No pending invitations.</p>'}</section>` : ''}
++    ${has('roster.manage') ? `<section class="card"><h2>Member cards</h2><p class="muted small">Edit a card to update its display name, bio, image, or division roles. Website Developers can also manage website roles, roster titles, permissions and account recovery, and remove accounts.</p>
++    ${data.members.map(p => `<div class="li"><div><b>${esc(p.displayName || p.username)}</b><small>@${esc(p.username)} · ${label(p.role)}${p.rosterTitle ? ` · Roster: ${label(p.rosterTitle)}` : ''} · ${p.divisions.map(label).join(', ') || 'No divisions'}${p.permissions?.length ? ` · ${p.permissions.length} custom permission${p.permissions.length > 1 ? 's' : ''}` : ''}${p.discordUsername ? ` · Discord: ${esc(p.discordUsername)}` : ''}</small></div><div class="actions"><button class="ghost small" data-profile="${esc(p.id)}">Edit card</button>${isDev() && p.id !== me.id ? `<button class="ghost small" data-reset="${esc(p.id)}">Reset account</button><button class="danger small" data-delete="deleteMember" data-id="${esc(p.id)}">Remove account</button>` : ''}</div></div>`).join('')}</section>
+     <section class="card"><div class="section-heading"><h2>Public roster</h2><button class="ghost small" id="new-roster">Add entry ↗</button></div><p class="muted small">Member cards appear automatically in their roster groups. Use entries for additional public roster members.</p>
+-    ${data.roster.map(r => `<div class="li"><div><b>${esc(r.displayName)}</b><small>${label(r.division)} · ${esc(r.title)}</small></div><div class="actions"><button class="ghost small" data-roster="${esc(r.id)}">Edit</button><button class="danger small" data-delete="deleteRoster" data-id="${esc(r.id)}">Remove</button></div></div>`).join('') || '<p class="muted small">No additional roster entries.</p>'}</section>
+-    <section class="card"><h2>Announcements</h2><form data-action="announce" class="row"><label class="sr-only" for="announcement">Announcement</label><input id="announcement" name="body" maxlength="2000" placeholder="Share an update with the team…" required><button class="btn">Post update</button></form>${li(data.announcements, a => esc(a.body), 'deleteAnnouncement')}</section>
+-    <section class="card"><h2>Team vault</h2><form data-action="addResource" class="f"><label>Title<input name="title" required maxlength="200" placeholder="Resource name"></label><label>Link<input name="url" type="url" placeholder="https://…" required></label><label>Minimum website role<select name="minRole">${options(ROLES, 'member')}</select></label><label>Division<select name="division"><option value="">Everyone</option>${options(DIVS)}</select></label><button class="btn">Add resource</button></form>${li(data.resources, r => `${esc(r.title)}<small>${label(r.minRole)} · ${r.division ? label(r.division) : 'Everyone'}</small>`, 'deleteResource')}</section>
+-    <section class="card"><h2>TikTok / @teamyvo</h2><p class="muted small">The live @teamyvo profile feed appears on the home page and in #tiktok. TikTok controls the posts shown in its embed. You can also pin individual team videos below.</p><a class="ghost small" href="#/hub" id="view-tiktok">Open TikTok channel ↗</a><form data-action="addTikTok" class="row"><label class="sr-only" for="tiktok-url">Team TikTok video URL</label><input id="tiktok-url" name="url" type="url" placeholder="https://www.tiktok.com/@teamyvo/video/…" required><button class="btn">Pin video</button></form>${li(data.posts, p => esc(p.title || 'Team video'), 'deleteTikTok')}</section></div>`;
++    ${data.roster.map(r => `<div class="li"><div><b>${esc(r.displayName)}</b><small>${label(r.division)} · ${esc(r.title)}</small></div><div class="actions"><button class="ghost small" data-roster="${esc(r.id)}">Edit</button><button class="danger small" data-delete="deleteRoster" data-id="${esc(r.id)}">Remove</button></div></div>`).join('') || '<p class="muted small">No additional roster entries.</p>'}</section>` : ''}
++    ${has('announcements.manage') ? `<section class="card"><h2>Announcements</h2><form data-action="announce" class="row"><label class="sr-only" for="announcement">Announcement</label><input id="announcement" name="body" maxlength="2000" placeholder="Share an update with the team…" required><button class="btn">Post update</button></form>${li(data.announcements, a => esc(a.body), 'deleteAnnouncement')}</section>` : ''}
++    ${has('vault.manage') ? `<section class="card"><h2>Team vault</h2><form data-action="addResource" class="f"><label>Title<input name="title" required maxlength="200" placeholder="Resource name"></label><label>Link<input name="url" type="url" placeholder="https://…" required></label><label>Minimum website role<select name="minRole">${options(ROLES, 'member')}</select></label><label>Division<select name="division"><option value="">Everyone</option>${options(DIVS)}</select></label><button class="btn">Add resource</button></form>${li(data.resources, r => `${esc(r.title)}<small>${label(r.minRole)} · ${r.division ? label(r.division) : 'Everyone'}</small>`, 'deleteResource')}</section>` : ''}
++    ${has('tiktok.manage') ? `<section class="card"><h2>TikTok / @teamyvo</h2><p class="muted small">The live @teamyvo profile feed appears on the home page and in #tiktok. TikTok controls the posts shown in its embed. You can also pin individual team videos below.</p><a class="ghost small" href="#/hub" id="view-tiktok">Open TikTok channel ↗</a><form data-action="addTikTok" class="row"><label class="sr-only" for="tiktok-url">Team TikTok video URL</label><input id="tiktok-url" name="url" type="url" placeholder="https://www.tiktok.com/@teamyvo/video/…" required><button class="btn">Pin video</button></form>${li(data.posts, p => esc(p.title || 'Team video'), 'deleteTikTok')}</section>` : ''}</div>`;
+   $('#copy-token')?.addEventListener('click', async () => { try { await navigator.clipboard.writeText(newToken.token); notify('Token copied.'); } catch { notify('Select the token and copy it manually.'); } });
+   $('#dismiss-token')?.addEventListener('click', () => admin());
+-  $('#new-roster').onclick = () => editRoster({}, admin);
++  $('#new-roster')?.addEventListener('click', () => editRoster({}, admin));
+   document.querySelectorAll('[data-profile]').forEach(b => b.onclick = () => editProfile(data.members.find(p => p.id === b.dataset.profile), admin));
++  document.querySelectorAll('[data-reset]').forEach(b => b.onclick = async () => {
++    const person = data.members.find(p => p.id === b.dataset.reset);
++    if (!confirm(`Create a new activation token for ${person.username}? Their previous token stops working. Their account, roster entry and data are kept.`)) return;
++    b.disabled = true;
++    try { const result = await api('resetAccount', { id: person.id }); await admin(result); $('.tok')?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
++    catch (error) { $('#admin-error').textContent = error.message; b.disabled = false; }
++  });
+   document.querySelectorAll('[data-roster]').forEach(b => b.onclick = () => editRoster(data.roster.find(p => p.id === b.dataset.roster), admin));
+-  $('#view-tiktok').onclick = () => sessionStorage.setItem('yvo-hub-channel', 'tiktok');
++  $('#view-tiktok')?.addEventListener('click', () => sessionStorage.setItem('yvo-hub-channel', 'tiktok'));
+   document.querySelectorAll('[data-action]').forEach(form => form.onsubmit = async e => {
+     e.preventDefault(); const button = form.querySelector('button'); button.disabled = true; $('#admin-error').textContent = '';
+     try {
+-      const payload = formData(form); if (form.dataset.action === 'createInvite') payload.divisions = selectedDivisions(form);
++      const payload = formData(form); if (form.dataset.action === 'createInvite') { payload.divisions = selectedDivisions(form); payload.permissions = selectedPermissions(form); }
+       const result = await api(form.dataset.action, payload); await admin(result.token ? result : null); if (!result.token) notify('Saved.');
+     } catch (error) { $('#admin-error').textContent = error.message; $('#admin-error').scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+     finally { if (button.isConnected) button.disabled = false; }
+@@ -308,4 +395,12 @@ if (authMode === 'identity' && document.cookie.includes('nf_jwt=')) {
+   try { await (await identity()).getUser(); } catch { /* The API rejects invalid sessions. */ }
+ }
+ await loadMe();
++{
++  const status = new URLSearchParams(location.search).get('discord');
++  if (status) {
++    const clean = new URL(location.href); clean.searchParams.delete('discord'); history.replaceState(null, '', clean);
++    sessionStorage.setItem('yvo-hub-pane', 'settings');
++    setTimeout(() => notify(DISCORD_MESSAGES[status] || DISCORD_MESSAGES.error), 400);
++  }
++}
+ await route();
+diff --git a/public/index.html b/public/index.html
+index 12faf7b..507c4ac 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -16,7 +16,7 @@
+   <a class="skip" href="#app">Skip to content</a>
+   <header><nav id="nav" aria-label="Main navigation"><a class="logo" href="#/"><img src="/assets/yvo-mark.png" alt="Team YVO"><span>TEAM <b>YVO</b></span></a><a href="#/roster">Roster</a><a href="#/login">Log in</a></nav></header>
+   <main id="app" tabindex="-1"><div class="loading-state" aria-live="polite">Loading Team YVO…</div></main>
+-  <footer><a class="logo" href="#/"><img src="/assets/yvo-mark.png" alt=""><span>TEAM <b>YVO</b></span></a><span>Players. Creators. One team.</span><a href="https://www.tiktok.com/@teamyvo" target="_blank" rel="noopener noreferrer">@teamyvo ↗</a></footer>
++  <footer><a class="logo" href="#/"><img src="/assets/yvo-mark.png" alt=""><span>TEAM <b>YVO</b></span></a><span>Players. Creators. One team.</span><a href="https://discord.gg/NtSChwqRGJ" target="_blank" rel="noopener noreferrer">Join Our Discord ↗</a><a href="https://www.tiktok.com/@teamyvo" target="_blank" rel="noopener noreferrer">@teamyvo ↗</a></footer>
+   <dialog id="modal" aria-labelledby="modal-title"></dialog>
+   <div id="toast" role="status" aria-live="polite"></div>
+   <noscript>Please enable JavaScript to use Team YVO.</noscript>
+diff --git a/public/styles.css b/public/styles.css
+index 94b29e1..02945a4 100644
+--- a/public/styles.css
++++ b/public/styles.css
+@@ -3,3 +3,8 @@
+ @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*:before,*:after{animation:none!important;transition:none!important}}
+ .arena{position:absolute;width:115%;bottom:-2%;left:-7%;color:rgba(175,211,255,.18);transform:perspective(400px) rotateX(15deg);z-index:-1}.sr-only{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+ .division-strip a{text-transform:uppercase}@media(max-width:600px){nav>a[href="#/"]:not(.logo){display:none}}
++
++.nav-discord{color:#c2d0e1}.discord-link{border-color:rgba(114,137,218,.55)}.discord-link:hover{background:rgba(88,101,242,.16);border-color:#7289da}
++.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:20px;align-items:start}
++footer>a[href*="discord"]{color:var(--text);text-decoration:none}
++@media(max-width:600px){.nav-discord{display:none}.hero-actions .discord-link{width:100%}}
+diff --git a/tests/database.integration.mjs b/tests/database.integration.mjs
+index fe913c5..e209915 100644
+--- a/tests/database.integration.mjs
++++ b/tests/database.integration.mjs
+@@ -1,69 +1,265 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { readFile } from 'node:fs/promises';
++import { readFile, readdir } from 'node:fs/promises';
+ import { randomUUID } from 'node:crypto';
+ import { PGlite } from '@electric-sql/pglite';
+ import { drizzle } from 'drizzle-orm/pglite';
+-import { eq } from 'drizzle-orm';
++import { eq, and } from 'drizzle-orm';
+ import { createApp } from '../netlify/server/app.mjs';
+ import { createIdentityHandlers } from '../netlify/server/identity-handlers.mjs';
+ import * as schema from '../db/schema.ts';
+ 
++const base = 'https://teamyvo.netlify.app';
++const migrationsDir = new URL('../netlify/database/migrations/', import.meta.url);
++async function applyMigration(tx, name) {
++  const sql = await readFile(new URL(name + '/migration.sql', migrationsDir), 'utf8');
++  for (const statement of sql.split('--> statement-breakpoint')) if (statement.trim()) await tx.execute(statement);
++}
++
+ // Every table, test account, generated credential and message is rolled back.
+-test('isolated Postgres: migrations, invitation claims, permissions, edits and chat moderation', async () => {
++test('isolated Postgres: data-preserving migration, roles, permissions, recovery, Discord and existing features', async () => {
+   const storage = new PGlite();
+   const database = drizzle({ client: storage, schema });
+   const rollback = new Error('expected-test-rollback');
++  const savedEnv = { ...process.env };
+   try {
+     await database.transaction(async tx => {
+       const namespace = 'yvo_test_' + randomUUID().replaceAll('-', '');
+       await tx.execute(`CREATE SCHEMA ${namespace}`);
+       await tx.execute(`SET LOCAL search_path TO ${namespace}`);
+-      const migration = await readFile(new URL('../netlify/database/migrations/20261119230553_create_team_hub/migration.sql', import.meta.url), 'utf8');
+-      for (const statement of migration.split('--> statement-breakpoint')) if (statement.trim()) await tx.execute(statement);
+-      const initialOwners = await tx.select().from(schema.profiles);
+-      assert.equal(initialOwners.length, 2);
+-      let currentId = initialOwners[0].id;
+-      const app = createApp({ database: tx, authenticateUser: async () => currentId ? (await tx.select().from(schema.profiles).where(eq(schema.profiles.id, currentId)))[0] : null });
+-      const call = async (action, fields = {}, origin = 'https://teamyvo.netlify.app') => app.request('https://teamyvo.netlify.app/api/action', {
+-        method: 'POST', headers: { 'content-type': 'application/json', origin }, body: JSON.stringify({ action, ...fields }),
+-      });
+-      const fixture = async (role, divisions = ['cch', 'vfx']) => {
+-        const [row] = await tx.insert(schema.profiles).values({ id: randomUUID(), username: 'test_' + role.replace('-', '_'), role, divisions }).returning();
+-        return row;
++      const names = (await readdir(migrationsDir)).sort();
++      assert.equal(names.length, 2);
++
++      // ---- Migration 1 + legacy-style data, then migration 2 must preserve everything.
++      await applyMigration(tx, names[0]);
++      const legacy = (role, username) => tx.execute(`INSERT INTO profiles (id, username, role, divisions, bio) VALUES ('${randomUUID()}', '${username}', '${role}', '{cch}', 'keep me')`);
++      await tx.execute(`INSERT INTO roster_members (id, display_name, title, division, sort) VALUES ('r1','Founder','Founder','owner',0),('r2','Second','Captain','co-owner',1),('r3','Mod','Mod','admin',2),('r4','Clipper','Editor','vfx',3)`);
++      await tx.execute(`INSERT INTO resources (id, title, url, min_role) VALUES ('v1','Owner doc','https://example.com/a','owner'),('v2','Co doc','https://example.com/b','co-owner'),('v3','Open','https://example.com/c','member')`);
++      await tx.execute(`INSERT INTO invites (id, token_hash, username, role, expires_at) VALUES ('i1','h1','pending_co','co-owner', now() + interval '1 day')`);
++      await legacy('co-owner', 'legacy_co'); await legacy('admin', 'legacy_admin'); await legacy('member', 'legacy_member');
++      const before = (await tx.execute('SELECT id, username, bio, created_at FROM profiles')).rows;
++      const messagesBefore = (await tx.select().from(schema.messages)).length;
++      await applyMigration(tx, names[1]);
++      const after = await tx.select().from(schema.profiles);
++      assert.equal(after.length, before.length, 'no account is lost');
++      assert.equal((await tx.select().from(schema.messages)).length, messagesBefore, 'messages are kept');
++      const byName = n => after.find(p => p.username === n);
++      for (const original of before) { const now = byName(original.username); assert.equal(now.id, original.id); assert.equal(now.bio, original.bio); assert.equal(new Date(now.createdAt).getTime(), new Date(original.created_at).getTime()); }
++      const originalDevelopers = after.filter(p => ['bambuggarl', 'bambugga'].includes(p.username));
++      assert.equal(originalDevelopers.length, 2);
++      for (const dev of originalDevelopers) { assert.equal(dev.role, 'website-developer'); assert.equal(dev.rosterTitle, 'owner'); }
++      assert.equal(byName('legacy_co').role, 'admin'); assert.equal(byName('legacy_co').rosterTitle, 'co-owner');
++      assert.equal(byName('legacy_admin').role, 'admin'); assert.equal(byName('legacy_admin').rosterTitle, 'admin');
++      assert.equal(byName('legacy_member').role, 'member'); assert.equal(byName('legacy_member').rosterTitle, '');
++      for (const p of after) assert.deepEqual(p.permissions, []);
++      assert.equal(after.some(p => ['owner', 'co-owner'].includes(p.role)), false);
++      const roster = Object.fromEntries((await tx.select().from(schema.rosterMembers)).map(r => [r.id, r]));
++      assert.deepEqual([roster.r1.division, roster.r1.rosterTitle], ['leadership', 'owner']);
++      assert.deepEqual([roster.r2.division, roster.r2.rosterTitle, roster.r2.title], ['leadership', 'co-owner', 'Captain']);
++      assert.deepEqual([roster.r3.division, roster.r3.rosterTitle], ['administration', 'admin']);
++      assert.deepEqual([roster.r4.division, roster.r4.rosterTitle], ['vfx', '']);
++      const minRoles = Object.fromEntries((await tx.select().from(schema.resources)).map(r => [r.id, r.minRole]));
++      assert.deepEqual(minRoles, { v1: 'website-developer', v2: 'admin', v3: 'member' });
++      const [pendingInvite] = await tx.select().from(schema.invites);
++      assert.deepEqual([pendingInvite.role, pendingInvite.rosterTitle], ['admin', 'co-owner']);
++      await tx.delete(schema.invites); await tx.delete(schema.rosterMembers); await tx.delete(schema.resources);
++
++      // ---- App under test
++      const developers = originalDevelopers;
++      let currentId = developers[0].id;
++      const recorded = [];
++      const passwords = { supports: () => true, set: async (profile, password) => { if (passwords.fail) throw new Error('provider-down'); recorded.push({ id: profile.id, password }); } };
++      process.env.DISCORD_CLIENT_ID = '999000111222333444'; process.env.DISCORD_CLIENT_SECRET = 'super-secret-value'; process.env.URL = base;
++      delete process.env.DISCORD_REDIRECT_URI;
++      const discordRequests = []; let discordUser = { id: '123456789012345678', username: 'dc_user' };
++      const fetchImpl = async (url, init = {}) => {
++        discordRequests.push({ url: String(url), init });
++        const json = body => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
++        if (String(url).endsWith('/oauth2/token')) return json({ access_token: 'access-token', token_type: 'Bearer' });
++        if (String(url).endsWith('/users/@me')) return json(discordUser);
++        return json({});
+       };
+-      const admin = await fixture('admin'), staff = await fixture('staff'), member = await fixture('member'), coowner = await fixture('co-owner');
+-      for (const person of [admin, staff, member, coowner]) {
++      const app = createApp({ database: tx, passwords, fetchImpl, authenticateUser: async () => currentId ? (await tx.select().from(schema.profiles).where(eq(schema.profiles.id, currentId)))[0] : null });
++      const post = async (path, fields = {}, origin = base) => app.request(base + path, { method: 'POST', headers: { 'content-type': 'application/json', origin }, body: JSON.stringify(fields) });
++      const call = (action, fields = {}, origin) => post('/api/action', { action, ...fields }, origin);
++      const fixture = async (role, extra = {}) => (await tx.insert(schema.profiles).values({ id: randomUUID(), username: 'test_' + randomUUID().slice(0, 8).replaceAll('-', ''), role, divisions: ['cch', 'vfx'], ...extra }).returning())[0];
++      const reload = async id => (await tx.select().from(schema.profiles).where(eq(schema.profiles.id, id)))[0];
++      const admin = await fixture('admin', { rosterTitle: 'co-owner' }), staff = await fixture('staff'), member = await fixture('member');
++      const titled = await fixture('member', { rosterTitle: 'website-developer', divisions: ['staff'] });
++
++      // Developer-only powers: nobody else, whatever their title or custom permissions.
++      const allPerms = ['chat.moderate', 'divisions.all', 'roster.manage', 'announcements.manage', 'vault.manage', 'tiktok.manage'];
++      const loaded = await fixture('member', { permissions: allPerms });
++      for (const person of [admin, staff, member, titled, loaded]) {
+         currentId = person.id;
+-        assert.equal((await call('createInvite', { username: 'fresh_player', role: 'member' })).status, 403);
+-        assert.equal((await call('deleteMember', { id: member.id })).status, 403);
++        for (const [action, fields] of [['createInvite', { username: 'fresh_player', role: 'member' }], ['deleteMember', { id: member.id }], ['resetAccount', { id: member.id }], ['deleteInvite', { id: 'x' }]]) {
++          assert.equal((await call(action, fields)).status, 403, `${person.username} ${action}`);
++        }
+       }
+-      currentId = initialOwners[0].id;
++      currentId = titled.id;
++      assert.equal((await call('adminData')).status, 403, 'a roster title never grants access');
++      assert.equal((await call('announce', { body: 'hi' })).status, 403);
++      currentId = developers[0].id;
+       assert.equal((await call('createInvite', {}, 'https://example.org')).status, 403);
+-      const inviteResponse = await call('createInvite', { username: 'fresh_player', role: 'member', divisions: ['cch', 'invalid'] });
++
++      // ---- Token generation with custom permissions
++      assert.equal((await call('createInvite', { username: 'bad_perm', role: 'member', permissions: ['nope'] })).status, 400);
++      assert.equal((await call('createInvite', { username: 'bad_title', role: 'member', rosterTitle: 'king' })).status, 400);
++      assert.equal((await call('createInvite', { username: 'bad_role', role: 'co-owner' })).status, 400);
++      assert.equal((await call('createInvite', { username: 'bad_role', role: 'owner' })).status, 400);
++      const inviteResponse = await call('createInvite', { username: 'fresh_player', role: 'member', divisions: ['cch', 'invalid'], rosterTitle: 'co-owner', permissions: ['vault.manage', 'vault.manage'] });
+       assert.equal(inviteResponse.status, 200);
+       const { token } = await inviteResponse.json();
+       const [invite] = await tx.select().from(schema.invites);
+-      assert.deepEqual(invite.divisions, ['cch']);
+-      assert.equal(invite.tokenHash.length, 64);
++      assert.deepEqual(invite.divisions, ['cch']); assert.deepEqual(invite.permissions, ['vault.manage']); assert.equal(invite.rosterTitle, 'co-owner');
++      assert.equal(invite.tokenHash.length, 64); assert.notEqual(invite.tokenHash, token);
+       assert.equal(Math.round((new Date(invite.expiresAt) - Date.now()) / 86400000), 7);
+       const handlers = createIdentityHandlers(tx);
+       const deny = () => { throw new Error('identity-denied'); };
+       const identityUser = { id: randomUUID(), email: 'fresh_player@members.yvo.team', userMetadata: { activation_token: token }, appMetadata: {} };
+-      const validated = await handlers.userValidate({ user: identityUser, deny });
+-      assert.ok(validated.user.confirmedAt);
++      assert.ok((await handlers.userValidate({ user: identityUser, deny })).user.confirmedAt);
+       const signup = await handlers.userSignup({ user: identityUser, deny });
+       assert.equal(signup.user.userMetadata.activation_token, undefined);
+-      assert.ok(signup.user.confirmedAt);
+-      const [createdProfile] = await tx.select().from(schema.profiles).where(eq(schema.profiles.id, identityUser.id));
+-      assert.equal(createdProfile.role, 'member');
++      const created = await reload(identityUser.id);
++      assert.equal(created.role, 'member'); assert.deepEqual(created.permissions, ['vault.manage']); assert.equal(created.rosterTitle, 'co-owner');
+       await assert.rejects(() => handlers.userValidate({ user: identityUser, deny }), /identity-denied/);
+-      await assert.rejects(() => handlers.userValidate({ user: { ...identityUser, userMetadata: {} }, deny }), /identity-denied/);
++
++      // ---- Individual permissions are enforced server-side
++      currentId = created.id;
++      assert.equal((await call('addResource', { title: 'Guide', url: 'https://example.com/g', minRole: 'member' })).status, 200);
++      for (const [action, fields] of [['announce', { body: 'no' }], ['addRoster', { displayName: 'x', division: 'cch' }], ['timeoutMember', { id: member.id, minutes: 5 }], ['updateProfile', { id: member.id, role: 'member', divisions: [] }]]) {
++        assert.equal((await call(action, fields)).status, 403, action);
++      }
++      const managerResponse = await call('adminData');
++      assert.equal(managerResponse.status, 200);
++      const manager = await managerResponse.json();
++      assert.equal(manager.members.length, 0, 'vault-only manager does not receive the member list');
++      assert.equal((await (await call('hubData')).json()).me.can.includes('vault.manage'), true);
++      currentId = admin.id;
++      for (const fields of [{ role: 'website-developer' }, { permissions: ['vault.manage'] }, { rosterTitle: 'owner' }]) {
++        assert.equal((await call('updateProfile', { id: member.id, divisions: ['cch'], ...fields })).status, 403, JSON.stringify(fields));
++      }
++      assert.equal((await call('updateProfile', { id: member.id, displayName: 'Airborne', title: 'Player', divisions: ['cch'], role: 'member', permissions: [], rosterTitle: '' })).status, 200);
++      assert.deepEqual((await reload(member.id)).divisions, ['cch']);
++      const adminView = await (await call('adminData')).json();
++      assert.equal(adminView.members.some(m => 'permissions' in m), false, 'admins never see internal permissions');
++      currentId = developers[0].id;
++      assert.equal((await call('updateProfile', { id: member.id, divisions: ['cch'], role: 'member', permissions: ['bogus'] })).status, 400);
++      assert.equal((await call('updateProfile', { id: member.id, displayName: 'Airborne', divisions: ['cch'], role: 'member', permissions: ['announcements.manage'], rosterTitle: 'staff' })).status, 200);
++      const granted = await reload(member.id);
++      assert.deepEqual(granted.permissions, ['announcements.manage']); assert.equal(granted.rosterTitle, 'staff');
++      assert.equal((await tx.select().from(schema.auditLog).where(eq(schema.auditLog.action, 'updateAccess'))).length, 1);
++      assert.equal((await tx.select().from(schema.auditLog).where(eq(schema.auditLog.action, 'updateProfile'))).length, 1);
++      currentId = member.id;
++      assert.equal((await call('announce', { body: 'Granted' })).status, 200);
++      assert.equal((await call('addResource', { title: 'x', url: 'https://example.com', minRole: 'member' })).status, 403);
++      currentId = developers[0].id;
++      assert.equal((await call('updateProfile', { id: member.id, divisions: ['cch'], role: 'member', permissions: [] })).status, 200);
++      currentId = member.id;
++      assert.equal((await call('announce', { body: 'Revoked' })).status, 403, 'revocation is immediate');
++
++      // ---- Roster groups and titles
+       currentId = admin.id;
+-      assert.equal((await call('updateProfile', { id: member.id, displayName: 'Airborne', title: 'Player', divisions: ['cch'], role: 'owner' })).status, 403);
+-      assert.equal((await call('updateProfile', { id: member.id, displayName: 'Airborne', title: 'Player', divisions: ['cch'], role: 'member' })).status, 200);
+-      const [updated] = await tx.select().from(schema.profiles).where(eq(schema.profiles.id, member.id));
+-      assert.deepEqual(updated.divisions, ['cch']);
++      assert.equal((await call('addRoster', { displayName: 'Aerial unit', division: 'leadership', rosterTitle: 'co-owner' })).status, 200);
++      assert.equal((await call('addRoster', { displayName: 'Mismatch', division: 'leadership', rosterTitle: 'admin' })).status, 400);
++      assert.equal((await call('addRoster', { displayName: 'Old group', division: 'co-owner' })).status, 400);
++      assert.equal((await call('addRoster', { displayName: 'Old group', division: 'owner' })).status, 400);
++      const [entry] = await tx.select().from(schema.rosterMembers);
++      assert.equal((await call('updateRoster', { id: entry.id, displayName: 'Air unit', title: 'Captain', division: 'administration', rosterTitle: 'admin' })).status, 200);
++
++      // ---- Account recovery
++      const target = await reload(member.id);
++      const clearLimits = () => tx.delete(schema.claimAttempts);
++      currentId = developers[0].id;
++      assert.equal((await call('resetAccount', { id: developers[0].id })).status, 400);
++      assert.equal((await call('resetAccount', { id: randomUUID() })).status, 404);
++      const first = await (await call('resetAccount', { id: target.id })).json();
++      assert.match(first.token, /^YVR-[0-9A-F]{32}$/);
++      const stored = await tx.select().from(schema.recoveryTokens);
++      assert.equal(stored.length, 1); assert.notEqual(stored[0].tokenHash, first.token); assert.equal(stored[0].tokenHash.length, 64);
++      assert.ok(Math.abs(new Date(first.expiresAt) - Date.now() - 86400000) < 60000, 'tokens are time-limited');
++      const second = await (await call('resetAccount', { id: target.id })).json();
++      assert.notEqual(second.token, first.token);
++      await clearLimits();
++      assert.equal((await post('/api/prepare-claim', { token: first.token })).status, 400, 'previous token is invalidated');
++      const prepared = await post('/api/prepare-claim', { token: second.token });
++      assert.deepEqual(await prepared.json(), { username: target.username, mode: 'recover' });
++      assert.equal((await post('/api/complete-recovery', { token: second.token, password: 'short' })).status, 400);
++      assert.equal((await post('/api/complete-recovery', { token: first.token, password: 'a-good-password' })).status, 400);
++      passwords.fail = true;
++      assert.equal((await post('/api/complete-recovery', { token: second.token, password: 'a-good-password' })).status, 500);
++      assert.equal((await tx.select().from(schema.recoveryTokens)).filter(r => !r.usedAt).length, 1, 'the unused token is still valid after a provider failure');
++      passwords.fail = false; await clearLimits();
++      const redeemed = await post('/api/complete-recovery', { token: second.token, password: 'a-good-password' });
++      assert.equal(redeemed.status, 200);
++      assert.deepEqual(recorded, [{ id: target.id, password: 'a-good-password' }], 'a failed provider call did not burn the token');
++      const preserved = await reload(target.id);
++      for (const field of ['id', 'username', 'bio', 'displayName', 'divisions', 'role', 'rosterTitle', 'createdAt', 'provider']) assert.deepEqual(preserved[field], target[field], field);
++      await clearLimits();
++      assert.equal((await post('/api/complete-recovery', { token: second.token, password: 'another-password' })).status, 400, 'tokens are single-use');
++      assert.equal(recorded.length, 1);
++      const third = await (await call('resetAccount', { id: target.id })).json();
++      await tx.execute(`UPDATE recovery_tokens SET expires_at = now() - interval '1 second' WHERE used_at IS NULL`);
++      await clearLimits();
++      assert.equal((await post('/api/complete-recovery', { token: third.token, password: 'another-password' })).status, 400, 'tokens expire');
++      const actions = (await tx.select().from(schema.auditLog)).map(a => a.action);
++      assert.equal(actions.filter(a => a === 'resetAccount').length, 3); assert.equal(actions.filter(a => a === 'accountRecovered').length, 1);
++      assert.equal(JSON.stringify(await tx.select().from(schema.auditLog)).includes('a-good-password'), false);
++      assert.equal((await post('/api/complete-recovery', { token: 'x', password: 'a-good-password' }, 'https://example.org')).status, 403);
++      await clearLimits();
++      for (let i = 0; i < 9; i++) await post('/api/prepare-claim', { token: 'YVR-WRONG' });
++      assert.equal((await post('/api/prepare-claim', { token: 'YVR-WRONG' })).status, 429, 'guessing is rate limited');
++      await clearLimits();
++
++      // ---- Discord OAuth2
++      currentId = member.id;
++      const start = await call('discordStart');
++      assert.equal(start.status, 200);
++      const startBody = await start.json(), authorize = new URL(startBody.url);
++      assert.equal(authorize.origin + authorize.pathname, 'https://discord.com/oauth2/authorize');
++      assert.equal(authorize.searchParams.get('scope'), 'identify'); assert.equal(authorize.searchParams.get('client_id'), '999000111222333444');
++      assert.equal(authorize.searchParams.get('redirect_uri'), base + '/api/discord/callback');
++      assert.equal(JSON.stringify(startBody).includes('super-secret-value'), false, 'client secret never reaches the browser');
++      const state = authorize.searchParams.get('state'), cookie = start.headers.get('set-cookie');
++      assert.match(cookie, /HttpOnly/i); assert.match(cookie, /Secure/i); assert.match(cookie, /SameSite=Lax/i);
++      assert.equal((await tx.select().from(schema.oauthStates)).some(r => r.stateHash === state), false, 'state is stored hashed');
++      const callback = (query, cookieHeader) => app.request(base + '/api/discord/callback?' + query, { headers: cookieHeader ? { cookie: cookieHeader } : {} });
++      const cookieHeader = 'yvo_discord_state=' + state;
++      const loc = r => r.headers.get('location');
++      assert.equal(loc(await callback('code=abc&state=' + state)), '/?discord=invalid#/hub', 'missing cookie');
++      assert.equal(loc(await callback('code=abc&state=forged', cookieHeader)), '/?discord=invalid#/hub', 'forged state');
++      assert.equal(discordRequests.length, 0, 'no token exchange happens for invalid requests');
++      assert.equal(loc(await callback('code=abc&state=' + state, cookieHeader)), '/?discord=linked#/hub');
++      const exchange = discordRequests.find(r => r.url.endsWith('/oauth2/token') && !r.url.includes('revoke'));
++      assert.equal(new URLSearchParams(exchange.init.body).get('grant_type'), 'authorization_code');
++      assert.match(exchange.init.headers.Authorization, /^Basic /);
++      const linked = await reload(member.id);
++      assert.deepEqual([linked.discordId, linked.discordUsername], ['123456789012345678', 'dc_user']);
++      assert.equal(loc(await callback('code=abc&state=' + state, cookieHeader)), '/?discord=invalid#/hub', 'state is single-use');
++      assert.equal((await (await app.request(base + '/api/me')).json()).me.discordUsername, 'dc_user');
++      const publicData = await (await app.request(base + '/api/public')).json();
++      assert.equal(JSON.stringify(publicData).includes('dc_user'), false); assert.equal(JSON.stringify(publicData).includes('123456789012345678'), false);
++      // Duplicate linking is refused
++      currentId = staff.id;
++      const startTwo = await (await call('discordStart')).json(); const stateTwo = new URL(startTwo.url).searchParams.get('state');
++      assert.equal(loc(await callback('code=abc&state=' + stateTwo, 'yvo_discord_state=' + stateTwo)), '/?discord=duplicate#/hub');
++      assert.equal((await reload(staff.id)).discordId, null);
++      // Cancelled authorization
++      const startThree = await (await call('discordStart')).json(); const stateThree = new URL(startThree.url).searchParams.get('state');
++      assert.equal(loc(await callback('error=access_denied&state=' + stateThree, 'yvo_discord_state=' + stateThree)), '/?discord=denied#/hub');
++      // Disconnect, then another account may use it
++      currentId = member.id;
++      assert.equal((await call('discordDisconnect')).status, 200);
++      assert.deepEqual([(await reload(member.id)).discordId, (await reload(member.id)).discordUsername], [null, '']);
++      currentId = staff.id;
++      const startFour = await (await call('discordStart')).json(); const stateFour = new URL(startFour.url).searchParams.get('state');
++      assert.equal(loc(await callback('code=abc&state=' + stateFour, 'yvo_discord_state=' + stateFour)), '/?discord=linked#/hub');
++      // Not configured
++      delete process.env.DISCORD_CLIENT_SECRET;
++      assert.equal((await call('discordStart')).status, 503);
++      process.env.DISCORD_CLIENT_SECRET = 'super-secret-value';
++
++      // ---- Existing features still work
+       currentId = member.id;
+       assert.equal((await call('sendMessage', { channel: 'vfx', body: 'restricted' })).status, 403);
+       assert.equal((await call('sendMessage', { channel: 'cch', body: 'First touch' })).status, 200);
+@@ -73,6 +269,7 @@ test('isolated Postgres: migrations, invitation claims, permissions, edits and c
+       assert.equal((await call('deleteMessage', { id: message.id })).status, 200);
+       assert.equal((await call('timeoutMember', { id: member.id, minutes: 10 })).status, 200);
+       assert.equal((await call('timeoutMember', { id: admin.id, minutes: 10 })).status, 403);
++      assert.equal((await call('timeoutMember', { id: developers[0].id, minutes: 10 })).status, 403);
+       currentId = member.id;
+       for (const channel of ['general', 'tiktok', 'cch']) assert.equal((await call('sendMessage', { channel, body: 'blocked' })).status, 403);
+       assert.equal((await call('messages', { channel: 'cch' })).status, 200);
+@@ -80,30 +277,28 @@ test('isolated Postgres: migrations, invitation claims, permissions, edits and c
+       assert.equal((await call('timeoutMember', { id: member.id, minutes: 0 })).status, 200);
+       currentId = member.id;
+       assert.equal((await call('sendMessage', { channel: 'general', body: 'Back in the game' })).status, 200);
+-      currentId = admin.id;
+-      assert.equal((await call('addRoster', { displayName: 'Aerial unit', division: 'co-owner' })).status, 200);
+-      const [entry] = await tx.select().from(schema.rosterMembers);
+-      assert.equal((await call('updateRoster', { id: entry.id, displayName: 'Air unit', title: 'Captain', division: 'owner' })).status, 200);
+-      currentId = initialOwners[0].id;
++      currentId = developers[0].id;
+       assert.equal((await call('deleteMember', { id: member.id })).status, 200);
++      assert.equal((await tx.select().from(schema.recoveryTokens).where(eq(schema.recoveryTokens.profileId, member.id))).length, 0);
+       currentId = member.id;
+       assert.equal((await call('hubData')).status, 401);
+-      const [tombstone] = await tx.select().from(schema.profiles).where(eq(schema.profiles.id, member.id));
+-      assert.equal(tombstone.deleted, true);
++      assert.equal((await reload(member.id)).deleted, true);
+       assert.equal((await tx.select().from(schema.messages).where(eq(schema.messages.userId, member.id))).length, 0);
+       await assert.rejects(() => handlers.userLogin({ user: { id: member.id }, deny }), /identity-denied/);
+-      currentId = initialOwners[0].id;
+-      assert.equal((await call('updateProfile', { id: initialOwners[1].id, role: 'member', divisions: [] })).status, 200);
+-      assert.equal((await call('updateProfile', { id: initialOwners[0].id, role: 'member', divisions: [] })).status, 400);
+-      const publicResponse = await app.request('https://teamyvo.netlify.app/api/public');
++      currentId = developers[0].id;
++      assert.equal((await call('updateProfile', { id: developers[1].id, role: 'member', divisions: [] })).status, 200);
++      assert.equal((await call('updateProfile', { id: developers[0].id, role: 'member', divisions: [] })).status, 400, 'the last Website Developer cannot be demoted');
++      assert.equal((await reload(developers[0].id)).role, 'website-developer');
++      const publicResponse = await app.request(base + '/api/public');
+       assert.equal(publicResponse.status, 200);
+-      const publicData = await publicResponse.json();
+-      assert.equal(publicData.members.some(p => p.id === member.id), false);
+-      assert.equal('timeoutUntil' in publicData.members[0], false);
++      const publicList = (await publicResponse.json()).members;
++      assert.equal(publicList.some(p => p.id === member.id), false);
++      for (const card of publicList) for (const field of ['timeoutUntil', 'role', 'permissions', 'provider', 'discordId', 'discordUsername']) assert.equal(field in card, false);
++      assert.ok(publicList.some(p => p.rosterTitle === 'owner'));
+       currentId = null;
+       assert.equal((await call('hubData')).status, 401);
+       throw rollback;
+     });
+   } catch (error) { if (error !== rollback) throw error; }
+-  finally { await storage.close(); }
++  finally { Object.keys(process.env).filter(k => !(k in savedEnv)).forEach(k => delete process.env[k]); Object.assign(process.env, savedEnv); await storage.close(); }
+ });
+diff --git a/tests/permissions.test.mjs b/tests/permissions.test.mjs
+index fb48339..c3fae0e 100644
+--- a/tests/permissions.test.mjs
++++ b/tests/permissions.test.mjs
+@@ -1,49 +1,86 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { ROLES, requireOwner, requireRole, requireChannel, requireCanMessage, requireCanModerate, requireProfileEdit, publicProfile } from '../netlify/server/permissions.mjs';
+-const user = (role, overrides = {}) => ({ id: role, role, username: role, divisions: ['cch'], deleted: false, ...overrides });
+-const denied = fn => assert.throws(fn, error => [401, 403, 404].includes(error.status));
++import {
++  ROLES, PERMISSION_KEYS, can, effectivePermissions, requireDeveloper, requireRole, requirePermission, requireManager, requireChannel,
++  requireCanMessage, requireCanModerate, requireProfileEdit, cleanPermissions, cleanRosterTitle, publicProfile, selfProfile, managerProfile,
++} from '../netlify/server/permissions.mjs';
++const user = (role, overrides = {}) => ({ id: role, role, username: role, divisions: ['cch'], permissions: [], rosterTitle: '', deleted: false, ...overrides });
++const denied = fn => assert.throws(fn, error => [400, 401, 403, 404].includes(error.status));
+ 
+-test('only owner rights grant token and account deletion permissions, including direct requests', () => {
+-  for (const role of ROLES) role === 'owner' ? requireOwner(user(role)) : denied(() => requireOwner(user(role)));
+-  denied(() => requireOwner(null)); denied(() => requireOwner(user('owner', { deleted: true })));
++test('system roles are member, staff, admin and website-developer only', () => {
++  assert.deepEqual(ROLES, ['member', 'staff', 'admin', 'website-developer']);
++  assert.equal(ROLES.includes('owner') || ROLES.includes('co-owner'), false);
+ });
+-test('staff, admins, co-owners and owners can moderate; members cannot', () => {
+-  for (const role of ROLES) role === 'member' ? denied(() => requireRole(user(role), 'staff')) : requireRole(user(role), 'staff');
++test('only Website Developers hold developer rights, including direct requests', () => {
++  for (const role of ROLES) role === 'website-developer' ? requireDeveloper(user(role)) : denied(() => requireDeveloper(user(role)));
++  denied(() => requireDeveloper(null)); denied(() => requireDeveloper(user('website-developer', { deleted: true })));
+ });
+-test('administrators may remove any division from a profile without changing its website role', () => {
++test('Website Developers have every permission regardless of stored permissions', () => {
++  for (const key of PERMISSION_KEYS) assert.equal(can(user('website-developer'), key), true);
++  assert.deepEqual(effectivePermissions(user('website-developer')), PERMISSION_KEYS);
++});
++test('roster titles never grant permissions, whatever the title or division', () => {
++  for (const rosterTitle of ['owner', 'co-owner', 'website-developer', 'admin', 'staff']) {
++    const member = user('member', { rosterTitle, divisions: ['staff'] });
++    for (const key of PERMISSION_KEYS) assert.equal(can(member, key), false, `${rosterTitle} must not grant ${key}`);
++    denied(() => requireDeveloper(member)); denied(() => requireManager(member)); denied(() => requireRole(member, 'staff'));
++  }
++});
++test('explicit permissions add exactly what was granted and nothing more', () => {
++  const member = user('member', { permissions: ['announcements.manage'] });
++  requirePermission(member, 'announcements.manage'); requireManager(member);
++  denied(() => requirePermission(member, 'vault.manage')); denied(() => requirePermission(member, 'chat.moderate'));
++  denied(() => requireDeveloper(member)); denied(() => requireProfileEdit(member, user('member'), 'member'));
++});
++test('existing staff and admin behaviour is preserved', () => {
++  requirePermission(user('staff'), 'chat.moderate'); denied(() => requirePermission(user('staff'), 'roster.manage'));
++  for (const key of PERMISSION_KEYS) requirePermission(user('admin'), key);
++  denied(() => requireDeveloper(user('admin')));
++});
++test('administrators may edit cards but only developers may change roles', () => {
+   requireProfileEdit(user('admin'), user('member'), 'member');
+-  requireProfileEdit(user('admin'), user('owner'), 'owner');
++  requireProfileEdit(user('admin'), user('website-developer'), 'website-developer');
+   denied(() => requireProfileEdit(user('staff'), user('member'), 'member'));
+-  denied(() => requireProfileEdit(user('admin'), user('member'), 'owner'));
+-  denied(() => requireProfileEdit(user('co-owner'), user('member'), 'admin'));
+-  requireProfileEdit(user('owner'), user('member'), 'admin');
++  denied(() => requireProfileEdit(user('admin'), user('member'), 'website-developer'));
++  denied(() => requireProfileEdit(user('website-developer'), user('member'), 'co-owner'));
++  requireProfileEdit(user('website-developer'), user('member'), 'admin');
++});
++test('permission and title input is validated', () => {
++  assert.deepEqual(cleanPermissions(['vault.manage', 'vault.manage']), ['vault.manage']);
++  denied(() => cleanPermissions(['everything'])); denied(() => cleanPermissions('vault.manage')); denied(() => cleanPermissions(['__proto__']));
++  assert.equal(cleanRosterTitle('co-owner'), 'co-owner'); assert.equal(cleanRosterTitle(''), ''); assert.equal(cleanRosterTitle(undefined), '');
++  denied(() => cleanRosterTitle('root'));
+ });
+ test('timeouts prevent sending in every channel but permit reading', () => {
+   const target = user('member', { timeoutUntil: new Date(Date.now() + 60000).toISOString() });
+-  for (const channel of ['general', 'tiktok', 'cch']) {
+-    requireChannel(target, channel); denied(() => requireCanMessage(target, channel));
+-  }
++  for (const channel of ['general', 'tiktok', 'cch']) { requireChannel(target, channel); denied(() => requireCanMessage(target, channel)); }
+   requireCanMessage(user('member', { timeoutUntil: new Date(Date.now() - 60000).toISOString() }), 'general');
+-  requireCanMessage(user('member', { timeoutUntil: null }), 'general');
+ });
+-test('division access is revoked when the division is removed from a card', () => {
++test('division access is revoked when the division is removed, unless divisions.all is held', () => {
+   requireChannel(user('member', { divisions: ['vfx'] }), 'vfx');
+   denied(() => requireChannel(user('member', { divisions: [] }), 'vfx'));
+   requireChannel(user('staff'), 'vfx');
+-  denied(() => requireChannel(user('owner'), 'unknown'));
++  requireChannel(user('member', { divisions: [], permissions: ['divisions.all'] }), 'vfx');
++  denied(() => requireChannel(user('website-developer'), 'unknown'));
+ });
+-test('moderators cannot timeout themselves, peers, higher roles or owners', () => {
++test('moderators cannot timeout themselves, peers, higher roles or developers', () => {
+   requireCanModerate(user('staff'), user('member'));
+   requireCanModerate(user('admin'), user('staff'));
+-  requireCanModerate(user('owner'), user('co-owner'));
++  requireCanModerate(user('website-developer'), user('admin'));
++  requireCanModerate(user('member', { permissions: ['chat.moderate'] }), user('member', { id: 'other' }));
++  denied(() => requireCanModerate(user('member', { permissions: ['chat.moderate'] }), user('staff')));
+   for (const role of ROLES) {
+-    denied(() => requireCanModerate(user(role), user('owner')));
++    denied(() => requireCanModerate(user(role), user('website-developer', { id: 'dev2' })));
+     denied(() => requireCanModerate(user(role), user(role)));
+   }
+   denied(() => requireCanModerate(user('staff'), user('admin')));
+ });
+-test('public cards do not expose moderation or authentication fields', () => {
+-  const card = publicProfile(user('member', { provider: 'identity', timeoutUntil: 'private', deleted: false }));
+-  for (const field of ['provider', 'timeoutUntil', 'deleted']) assert.equal(field in card, false);
++test('public cards hide roles, permissions, Discord and authentication fields', () => {
++  const secret = user('admin', { provider: 'identity', timeoutUntil: 'private', permissions: ['vault.manage'], discordId: '123456789012345678', discordUsername: 'dc', rosterTitle: 'co-owner' });
++  const card = publicProfile(secret);
++  for (const field of ['provider', 'timeoutUntil', 'deleted', 'role', 'permissions', 'can', 'discordId', 'discordUsername']) assert.equal(field in card, false, field);
++  assert.equal(card.rosterTitle, 'co-owner');
++  assert.equal('permissions' in managerProfile(secret, user('admin')), false);
++  assert.deepEqual(managerProfile(secret, user('website-developer')).permissions, ['vault.manage']);
++  assert.equal('discordId' in selfProfile(secret), false);
+ });
+diff --git a/tests/ui.browser.mjs b/tests/ui.browser.mjs
+index 323d97b..57b18eb 100644
+--- a/tests/ui.browser.mjs
++++ b/tests/ui.browser.mjs
+@@ -3,15 +3,17 @@ import assert from 'node:assert/strict';
+ import { chromium } from '@playwright/test';
+ 
+ const base = 'http://localhost:8889';
+-const profile = (id, role, divisions = ['cch', 'vfx']) => ({ id, username: id, displayName: id, role, divisions, title: '', bio: '', avatarUrl: '', createdAt: '2026-11-19T20:00:00Z' });
+-test('browser: owner/admin controls, card editing, staff moderation and responsive pages', async () => {
++const ALL = ['chat.moderate', 'divisions.all', 'roster.manage', 'announcements.manage', 'vault.manage', 'tiktok.manage'];
++const CAN = { 'website-developer': ALL, admin: ALL, staff: ['chat.moderate', 'divisions.all'], member: [] };
++const profile = (id, role, divisions = ['cch', 'vfx'], rosterTitle = '') => ({ id, username: id, displayName: id, role, rosterTitle, divisions, permissions: [], can: CAN[role], title: '', bio: '', avatarUrl: '', createdAt: '2026-11-19T20:00:00Z' });
++test('browser: developer/admin controls, roster divisions, settings, Discord invite, moderation and responsive pages', async () => {
+   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+   try {
+-    for (const role of ['owner', 'admin', 'staff', 'member']) {
++    for (const role of ['website-developer', 'admin', 'staff', 'member']) {
+       const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+       const page = await context.newPage();
+       let me = profile('current_' + role, role), member = profile('aerial', 'member');
+-      let members = [me, member, profile('captain', 'owner')], roster = [];
++      let members = [me, member, profile('captain', 'member', [], 'co-owner'), profile('chief', 'member', [], 'owner'), profile('mod', 'member', [], 'admin')], roster = [];
+       const messages = [{ id: 'message', username: member.username, userId: member.id, channel: 'general', body: 'A clean double tap.', createdAt: '2026-11-19T20:00:00Z' }];
+       const calls = [], errors = [];
+       page.on('pageerror', e => errors.push(e.message));
+@@ -23,7 +25,7 @@ test('browser: owner/admin controls, card editing, staff moderation and responsi
+         else if (path.endsWith('/public')) result = { members, roster, posts: [] };
+         else {
+           const p = route.request().postDataJSON(); calls.push(p);
+-          if (p.action === 'adminData') result = { members, roster, posts: [], invites: [], announcements: [], resources: [] };
++          if (p.action === 'adminData') result = { members, roster, posts: [], invites: [], announcements: [], resources: [], can: me.can };
+           else if (p.action === 'hubData') result = { me, announcements: [], resources: [], moderationMembers: members };
+           else if (p.action === 'messages') result = { messages, timeoutUntil: me.timeoutUntil };
+           else if (p.action === 'updateProfile') { Object.assign(member, p); result = { ok: true }; }
+@@ -33,16 +35,23 @@ test('browser: owner/admin controls, card editing, staff moderation and responsi
+         }
+         return route.fulfill({ contentType: 'application/json', body: JSON.stringify(result) });
+       });
+-      await page.goto(base + '/#/roster/owner');
++      await page.goto(base + '/#/roster/leadership');
+       await page.getByRole('heading', { name: 'The roster.' }).waitFor();
+-      await page.getByRole('button', { name: 'Co-Owner', exact: false }).waitFor();
+-      assert.equal(await page.getByRole('button', { name: 'Admin', exact: false }).count(), 1);
+-      if (['owner', 'admin'].includes(role)) {
++      await page.getByRole('button', { name: 'Leadership', exact: false }).waitFor();
++      assert.equal(await page.getByRole('button', { name: 'Administration', exact: false }).count(), 1);
++      assert.equal(await page.getByRole('button', { name: 'Staff', exact: false }).count(), 1);
++      // Leadership shows the Owner and Co-Owner titles as display labels only.
++      assert.equal(await page.locator('.role-label', { hasText: 'Co-Owner' }).count(), 1);
++      assert.equal(await page.locator('.role-label', { hasText: 'Owner' }).count() >= 1, true);
++      assert.equal(await page.locator('body').innerText().then(s => /vault\.manage|permissions/i.test(s)), false);
++      if (['website-developer', 'admin'].includes(role)) {
+         await page.goto(base + '/#/admin');
+         await page.getByRole('heading', { name: 'Team management.' }).waitFor();
+-        assert.equal(await page.getByRole('button', { name: /Generate token/ }).count(), role === 'owner' ? 1 : 0);
++        assert.equal(await page.getByRole('button', { name: /Generate token/ }).count(), role === 'website-developer' ? 1 : 0);
++        assert.equal(await page.getByText('Custom permissions').count() > 0, role === 'website-developer');
+         assert.equal(await page.locator('input[name=days]').count(), 0);
+-        assert.equal(await page.locator('[data-delete="deleteMember"]').count() > 0, role === 'owner');
++        assert.equal(await page.locator('[data-delete="deleteMember"]').count() > 0, role === 'website-developer');
++        assert.equal(await page.locator('[data-reset]').count() > 0, role === 'website-developer');
+         await page.locator('[data-profile="aerial"]').click();
+         await page.getByLabel('Display name').fill('Airborne');
+         await page.getByRole('dialog').getByLabel('VFX', { exact: true }).uncheck();
+@@ -53,15 +62,27 @@ test('browser: owner/admin controls, card editing, staff moderation and responsi
+         assert.equal(calls.find(p => p.action === 'updateProfile').role, 'member');
+         await page.getByRole('button', { name: 'Add entry' }).click();
+         await page.getByLabel('Display name').fill('Boost unit');
+-        await page.getByLabel('Roster group').selectOption('co-owner');
++        await page.getByLabel('Roster group').selectOption('leadership');
++        await page.getByLabel('Roster title (display only)').selectOption('co-owner');
+         await page.getByRole('button', { name: 'Save changes' }).click();
+         await page.getByRole('dialog').waitFor({ state: 'hidden' });
+-        assert.equal(roster[0].division, 'co-owner');
++        assert.equal(roster[0].division, 'leadership');
++        assert.equal(roster[0].rosterTitle, 'co-owner');
+       }
+       await page.goto(base + '/#/hub');
+       await page.getByRole('heading', { name: 'The team hub.' }).waitFor();
+       await page.getByText('A clean double tap.', { exact: true }).waitFor();
+       assert.equal(await page.getByRole('button', { name: 'Remove message by aerial' }).count(), role === 'member' ? 0 : 1);
++      // Account settings: password change (validated in the browser) and Discord linking, for every signed-in user.
++      await page.getByRole('button', { name: 'Settings', exact: true }).click();
++      await page.getByRole('heading', { name: 'Change password' }).waitFor();
++      await page.getByRole('button', { name: /Connect Discord/ }).waitFor();
++      await page.getByLabel('Current password').fill('old-password');
++      await page.getByLabel('New password', { exact: true }).fill('new-password-1');
++      await page.getByLabel('Repeat new password').fill('different-password');
++      await page.getByRole('button', { name: 'Update password' }).click();
++      await page.getByText('New passwords do not match.').waitFor();
++      await page.getByRole('button', { name: 'Team chat' }).click();
+       if (role !== 'member') {
+         await page.getByRole('button', { name: 'Timeout', exact: true }).click();
+         await page.getByLabel('Duration').selectOption('30');
+@@ -87,11 +108,16 @@ test('browser: owner/admin controls, card editing, staff moderation and responsi
+     await page.route('**/api/public', route => route.fulfill({ contentType: 'application/json', body: '{"members":[],"roster":[],"posts":[]}' }));
+     await page.goto(base);
+     await page.getByRole('heading', { name: /BUILT FOR/ }).waitFor();
++    const discord = page.locator('a[href="https://discord.gg/NtSChwqRGJ"]');
++    assert.equal(await discord.count() >= 2, true);
++    assert.equal(await page.getByRole('link', { name: /Join Our Discord/ }).first().getAttribute('target'), '_blank');
++    assert.match(await page.getByRole('link', { name: /Join Our Discord/ }).first().getAttribute('rel'), /noopener/);
+     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+     assert.equal(await page.locator('body').innerText().then(s => /cchn/i.test(s)), false);
+     await page.goto(base + '/#/login');
+     await page.getByRole('button', { name: 'Activate your account' }).click();
+     await page.getByLabel('Activation token').waitFor();
++    await page.getByRole('heading', { name: 'Join the lineup.' }).waitFor();
+     assert.equal(await page.getByLabel('Repeat password').count(), 1);
+     await page.close();
+   } finally { await browser.close(); }
+-- 
+2.43.0
+
