@@ -86,3 +86,19 @@ export const oauthStates = pgTable('oauth_states', {
   expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
   usedAt: timestamp('used_at', { withTimezone: true, mode: 'string' }),
 });
+export const recoveryTokens = pgTable('recovery_tokens', {
+  id: text('id').primaryKey(),
+  profileId: text('profile_id').notNull().references(() => profiles.id),
+  tokenHash: text('token_hash').notNull().unique(),
+  createdBy: text('created_by').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+  // Set when the token is used or replaced by a newer one.
+  usedAt: timestamp('used_at', { withTimezone: true, mode: 'string' }),
+}, (t) => [index('recovery_tokens_profile_idx').on(t.profileId)]);
+export const oauthStates = pgTable('oauth_states', {
+  stateHash: text('state_hash').primaryKey(),
+  profileId: text('profile_id').notNull().references(() => profiles.id),
+  expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+  usedAt: timestamp('used_at', { withTimezone: true, mode: 'string' }),
+});
