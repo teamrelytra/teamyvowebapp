@@ -30,10 +30,27 @@ async function request(path, payload) {
     if (session) { headers.Authorization = 'Bearer ' + session.access_token; headers['X-YVO-Auth'] = 'legacy'; }
   }
   if (payload) headers['Content-Type'] = 'application/json';
-  const r = await fetch('/api/' + path, { method: payload ? 'POST' : 'GET', headers, credentials: 'same-origin', ...(payload ? { body: JSON.stringify(payload) } : {}) });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || 'Could not connect. Please try again.');
-  return data;
+  const options = { method: payload ? 'POST' : 'GET', headers, credentials: 'same-origin', ...(payload ? { body: JSON.stringify(payload) } : {}) };
+  // Retry only safe GET requests after temporary Netlify Server/network failures.
+  // Never retry POST requests: actions may create duplicate records or messages.
+  const attempts = payload ? 1 : 3;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let r;
+    try {
+      r = await fetch('/api/' + path, options);
+    } catch (error) {
+      if (attempt === attempts - 1) throw new Error('Connection interrupted. Please try again.');
+      await new Promise(resolve => setTimeout(resolve, 300 * (2 ** attempt)));
+      continue;
+    }
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) return data;
+    if (![502, 503, 504].includes(r.status) || attempt === attempts - 1) {
+      throw new Error(data.error || 'Could not connect. Please try again.');
+    }
+    await new Promise(resolve => setTimeout(resolve, 300 * (2 ** attempt)));
+  }
+  throw new Error('Could not connect. Please try again.');
 }
 const api = (action, payload = {}) => request('action', { ...payload, action });
 function renderNav() {
